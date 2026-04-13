@@ -90,7 +90,9 @@ header {
 h1 {
     font-size: 1.9rem; font-weight: 700;
     background: linear-gradient(135deg, #6366f1 0%, #0ea5e9 100%);
-    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+    -webkit-background-clip: text;
+    background-clip: text;
+    -webkit-text-fill-color: transparent;
     line-height: 1.2;
 }
 header p { color: var(--text-sub); font-size: 0.95rem; font-weight: 300; }
@@ -101,10 +103,19 @@ header p { color: var(--text-sub); font-size: 0.95rem; font-weight: 300; }
     background: rgba(16, 185, 129, 0.1); color: var(--green);
     padding: 0.5rem 1rem; border-radius: 2rem; font-weight: 500; font-size: 0.9rem;
     border: 1px solid rgba(16, 185, 129, 0.2);
+    transition: all 0.3s ease;
+}
+.status-badge.connecting {
+    background: rgba(245, 158, 11, 0.1); color: var(--amber);
+    border-color: rgba(245, 158, 11, 0.2);
+}
+.status-badge.disconnected {
+    background: rgba(239, 68, 68, 0.1); color: var(--red);
+    border-color: rgba(239, 68, 68, 0.2);
 }
 .status-badge .dot {
-    width: 8px; height: 8px; background: var(--green); border-radius: 50%;
-    box-shadow: 0 0 8px var(--green); animation: blink 2s ease-in-out infinite;
+    width: 8px; height: 8px; background: currentColor; border-radius: 50%;
+    box-shadow: 0 0 8px currentColor; animation: blink 2s ease-in-out infinite;
 }
 @keyframes blink { 0%,100% { opacity: 0.5; } 50% { opacity: 1; } }
 
@@ -354,6 +365,17 @@ textarea::placeholder { color: var(--text-dim); }
     background: var(--red); color: white; display: inline-flex; align-items: center; justify-content: center;
     min-width: 18px; padding: 0 5px; height: 18px; border-radius: 9px; font-size: 0.65rem; font-weight: bold;
     box-shadow: 0 0 6px rgba(239,68,68,0.5);
+    transition: all 0.2s;
+}
+
+.badge-unread.badge-pop {
+    animation: badge-pop 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+}
+
+@keyframes badge-pop {
+    0% { transform: scale(1); }
+    50% { transform: scale(1.4); }
+    100% { transform: scale(1); }
 }
 
 .raw-feed {

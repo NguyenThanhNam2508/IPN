@@ -4,15 +4,29 @@ const path = require('path');
 
 const app = express();
 app.use(express.json());
+app.use(express.urlencoded({ extended: true, type: ['application/x-www-form-urlencoded', 'application/json'] }));
+app.use(express.text({ type: '*/*' })); // Dự phòng trường hợp gửi raw string không rõ type
 
 // Phục vụ giao diện UI tĩnh
 app.use(express.static(path.join(__dirname, 'public')));
+
+// Bắt lỗi JSON parsing của express.json()
+// Python thường gửi {"key": "val"} thành {'key': 'val'} làm hỏng cú pháp JSON.
+app.use((err, req, res, next) => {
+    if (err instanceof SyntaxError && err.status === 400 && 'body' in err) {
+        SystemLogToConsole('error', 'Cảnh báo: Đối tác gửi JSON sai định dạng (SyntaxError). Đang cứu hộ dữ liệu thô...', err.body);
+        req.body = err.body; // Gắn lại text thô
+        return next();
+    }
+    next();
+});
 
 // -------------------------------------------------------------
 // SESSIONS: MULTI-TENANT CONFIGURATION MỚI (Hỗ trợ Nhiều Key)
 // -------------------------------------------------------------
 const DEFAULT_SECRET_KEY = Buffer.from('VOTRE_SECRET_KEY_32_BYTES_LONG_!', 'utf-8');
 const sessions = new Map();
+const MAX_QUEUE_SIZE = 200; // Số sự kiện tối đa lưu buffer
 
 function getSession(clientId) {
     if (!clientId) return null;
@@ -28,7 +42,9 @@ function getSession(clientId) {
             tgToken: '',
             tgChatId: '',
             tgAutoSend: false,
-            sseClients: []
+            sseClients: [],
+            pollQueue: [],    // Queue cho HTTP Polling (không bị xóa bởi SSE)
+            eventQueue: []    // Queue replay khi UI reconnect SSE
         });
     }
     return sessions.get(clientId);
@@ -68,23 +84,54 @@ function formatTelegramMessage(fieldKey, dataStr, method) {
 // -------------------------------------------------------------
 // XỬ LÝ SERVER-SENT EVENTS (SSE) CHO LOG TRỰC TIẾP LÊN UI
 // -------------------------------------------------------------
+function pushToQueue(session, entry) {
+    // Poll queue: luôn lưu để HTTP polling lấy được
+    if (!session.pollQueue) session.pollQueue = [];
+    session.pollQueue.push(entry);
+    if (session.pollQueue.length > MAX_QUEUE_SIZE) session.pollQueue.shift();
+
+    // SSE replay queue: chỉ lưu khi không có SSE client (dùng để replay khi reconnect)
+    if (session.sseClients.length === 0) {
+        if (!session.eventQueue) session.eventQueue = [];
+        session.eventQueue.push(entry);
+        if (session.eventQueue.length > MAX_QUEUE_SIZE) session.eventQueue.shift();
+    }
+}
+
+function broadcastToClients(session, entry) {
+    if (!session.sseClients || session.sseClients.length === 0) return;
+    const staleClients = [];
+    session.sseClients.forEach(client => {
+        try {
+            client.res.write(`data: ${JSON.stringify(entry)}\n\n`);
+        } catch(e) {
+            staleClients.push(client);
+        }
+    });
+    if (staleClients.length > 0) {
+        session.sseClients = session.sseClients.filter(c => !staleClients.includes(c));
+    }
+}
+
 function emitLogToUI(clientId, logType, message, data = null, collapsed = false) {
     const session = getSession(clientId);
     if (!session) return;
     
+    const count = session.sseClients.length;
     const logEntry = {
-        id: Date.now(),
+        id: Date.now() + '_' + Math.random().toString(36).substr(2, 5),
         time: new Date().toLocaleTimeString(),
         type: logType,
         message,
         data,
         collapsed
     };
-    SystemLogToConsole(logType, message, data, clientId);
+    SystemLogToConsole(logType, `${message} (Active UI: ${count})`, data, clientId);
 
-    session.sseClients.forEach(client => {
-        client.res.write(`data: ${JSON.stringify(logEntry)}\n\n`);
-    });
+    // LUÔN lưu vào queue (cho HTTP polling và SSE replay)
+    pushToQueue(session, logEntry);
+    // Và broadcast qua SSE nếu có client
+    broadcastToClients(session, logEntry);
 }
 
 function emitRawIPN(clientId, rawBody, matchedKeyName = '', matchedKeyColor = '', matchedKeyId = '') {
@@ -93,22 +140,36 @@ function emitRawIPN(clientId, rawBody, matchedKeyName = '', matchedKeyColor = ''
 
     const entry = {
         type: 'raw_ipn',
+        id: Date.now() + '_' + Math.random().toString(36).substr(2, 5),
         time: new Date().toLocaleTimeString(),
         rawBody,
         matchedKeyName,
         matchedKeyColor,
         matchedKeyId
     };
-    session.sseClients.forEach(client => {
-        client.res.write(`data: ${JSON.stringify(entry)}\n\n`);
-    });
+
+    // LUÔN lưu vào queue + broadcast
+    pushToQueue(session, entry);
+    broadcastToClients(session, entry);
 }
 
 function SystemLogToConsole(type, msg, data, clientId = '') {
-    const prefix = clientId ? `[${clientId.substring(0, 8)}...]` : '';
-    if (type === 'error') console.error(`❌ ${prefix} ${msg}`, data || '');
-    else if (type === 'success') console.log(`✅ ${prefix} ${msg}`, data || '');
-    else console.log(`ℹ️ ${prefix} ${msg}`, data || '');
+    const prefix = clientId ? `[${clientId.substring(0, 8)}...]` : '[SYSTEM]';
+    const timestamp = new Date().toLocaleTimeString('vi-VN');
+    
+    // Đảm bảo data được log đẹp mắt
+    let logData = '';
+    if (data !== null && data !== undefined) {
+        if (typeof data === 'object') {
+            logData = '\n' + JSON.stringify(data, null, 2);
+        } else {
+            logData = ' ' + data;
+        }
+    }
+
+    if (type === 'error') console.error(`❌ [${timestamp}] ${prefix} ${msg}${logData}`);
+    else if (type === 'success') console.log(`✅ [${timestamp}] ${prefix} ${msg}${logData}`);
+    else console.log(`ℹ️ [${timestamp}] ${prefix} ${msg}${logData}`);
 }
 
 app.get('/api/events', (req, res) => {
@@ -117,18 +178,118 @@ app.get('/api/events', (req, res) => {
 
     const session = getSession(clientId);
 
+    // Header SSE chuẩn để tránh buffering bởi Proxy
     res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
     res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no'); // Dành cho Nginx
     
-    res.write(`data: ${JSON.stringify({ time: new Date().toLocaleTimeString(), type: 'success', message: '🟢 Đã kết nối Hệ thống Lắng nghe Webhook của bạn...' })}\n\n`);
+    // Gửi headers ngay lập tức
+    res.flushHeaders();
+
+    const queueSize = (session.eventQueue || []).length;
+    const connectMsg = queueSize > 0
+        ? `🟢 Đã kết nối! Đang phát lại ${queueSize} sự kiện bị miss...`
+        : '🟢 Đã kết nối Hệ thống Lắng nghe Webhook của bạn...';
     
-    const client = { res };
+    res.write(`data: ${JSON.stringify({ time: new Date().toLocaleTimeString(), type: 'success', message: connectMsg })}\n\n`);
+    
+    const client = { res, id: Date.now() };
     session.sseClients.push(client);
     
+    SystemLogToConsole('success', `Cửa sổ UI mới đã kết nối. Hiện có ${session.sseClients.length} tab đang nghe. Queue: ${queueSize} sự kiện chờ.`, null, clientId);
+
+    // REPLAY: Gửi lại tất cả sự kiện đã buffer khi UI offline
+    if (queueSize > 0) {
+        const queued = [...session.eventQueue];
+        session.eventQueue = []; // Xóa queue sau khi gửi
+        
+        // Gửi ngay với delay nhỏ để đảm bảo connection sẵn sàng
+        setTimeout(() => {
+            queued.forEach(entry => {
+                try {
+                    res.write(`data: ${JSON.stringify(entry)}\n\n`);
+                } catch(e) {
+                    // client đã ngắt trong khi replay
+                }
+            });
+            SystemLogToConsole('success', `Đã phát lại ${queued.length} sự kiện vào UI.`, null, clientId);
+        }, 150);
+    }
+
     req.on('close', () => {
-        session.sseClients = session.sseClients.filter(c => c !== client);
+        session.sseClients = session.sseClients.filter(c => c.id !== client.id);
+        SystemLogToConsole('info', `Một cửa sổ UI đã đóng. Còn lại ${session.sseClients.length} tab.`, null, clientId);
     });
+});
+
+// HEARTBEAT INTERVAl: Chống timeout cho các proxy như Ngrok/Cloudflare
+setInterval(() => {
+    sessions.forEach((session, clientId) => {
+        if (session.sseClients.length > 0) {
+            const stale = [];
+            session.sseClients.forEach(client => {
+                try {
+                    client.res.write(`: heartbeat\n\n`);
+                } catch(e) {
+                    stale.push(client);
+                }
+            });
+            if (stale.length > 0) {
+                session.sseClients = session.sseClients.filter(c => !stale.includes(c));
+                SystemLogToConsole('info', `Heartbeat: loại ${stale.length} SSE client chết. Còn lại ${session.sseClients.length}.`, null, clientId);
+            }
+        }
+    });
+}, 15000); // 15 giây kiểm tra một lần
+
+// -------------------------------------------------------------
+// HTTP POLLING FALLBACK: Cho phép UI lấy events khi SSE không ổn định
+// -------------------------------------------------------------
+app.get('/api/poll-events', (req, res) => {
+    const { clientId, since } = req.query;
+    if (!clientId) return res.status(400).json({ error: 'Thiếu clientId' });
+
+    const session = getSession(clientId);
+    
+    // Lấy tất cả events từ pollQueue
+    const allEvents = session.pollQueue || [];
+    
+    // Nếu client cung cấp `since` timestamp, chỉ trả về events mới hơn
+    let events = allEvents;
+    if (since) {
+        const sinceId = String(since);
+        const sinceIdx = allEvents.findIndex(e => String(e.id) === sinceId);
+        if (sinceIdx !== -1) {
+            events = allEvents.slice(sinceIdx + 1);
+        }
+    }
+    
+    res.json({ 
+        events,
+        lastId: allEvents.length > 0 ? allEvents[allEvents.length - 1].id : null,
+        sseClients: session.sseClients.length,
+        total: allEvents.length
+    });
+});
+
+// -------------------------------------------------------------
+// DEBUG ENDPOINT: Xem trạng thái sessions
+// -------------------------------------------------------------
+app.get('/api/debug-sessions', (req, res) => {
+    const result = {};
+    sessions.forEach((session, id) => {
+        result[id] = {
+            sseClients: session.sseClients.length,
+            pollQueueSize: (session.pollQueue || []).length,
+            eventQueueSize: (session.eventQueue || []).length,
+            keys: (session.keys || []).map(k => k.name),
+            lastEvent: session.pollQueue && session.pollQueue.length > 0 
+                ? session.pollQueue[session.pollQueue.length - 1]
+                : null
+        };
+    });
+    res.json(result);
 });
 
 // -------------------------------------------------------------
@@ -185,24 +346,101 @@ app.post('/api/config-keys', (req, res) => {
 // -------------------------------------------------------------
 // ENDPOINT IPN CHÍNH THỨC (AUTO DECRYPT VỚI NHIỀU KEY & GẮN TAG)
 // -------------------------------------------------------------
-app.post('/webhook/ipn/:clientId', (req, res) => {
-    const clientId = req.params.clientId;
-    const session = getSession(clientId);
+// Hỗ trợ dự phòng thông minh (Auto-Fallback) cho các đường dẫn lạ
+app.use((req, res, next) => {
+    if (req.method !== 'POST' && req.method !== 'GET') return next();
+    if (req.path.startsWith('/api/') || req.path.startsWith('/webhook/ipn')) return next();
+
+    const activeClients = Array.from(sessions.keys()).filter(id => sessions.get(id).sseClients.length > 0);
+    if (activeClients.length > 0) {
+        const liveClientId = activeClients[0];
+        // Bẻ lái mọi đường dẫn Callback/IPN lạ (vd: /callback, /, /ipn)
+        if (!req.path.includes('.') && req.path !== '/index.html' && req.path !== '/favicon.ico') {
+            SystemLogToConsole('info', `Chuyển hướng ngầm IPN từ path lạ: ${req.path} -> /webhook/ipn/${liveClientId}`);
+            req.url = `/webhook/ipn/${liveClientId}`;
+        }
+    }
+    next();
+});
+
+// Chấp nhận cả /webhook/ipn (không ID) và /webhook/ipn/:clientId
+app.all(['/webhook/ipn', '/webhook/ipn/:clientId'], (req, res) => {
+    let clientId = req.params.clientId;
+    
+    // Nếu không có ID trên URL, tìm Client đang mở Dashboard gần nhất
+    if (!clientId) {
+        const activeClients = Array.from(sessions.keys()).filter(id => sessions.get(id).sseClients.length > 0);
+        clientId = activeClients.length > 0 ? activeClients[0] : null;
+    }
+
+    // Tạo session mới nếu cần (để buffer IPN, UI sẽ nhận khi reconnect)
+    const session = clientId ? getSession(clientId) : null;
     if (!session) {
-        return res.status(404).json({ error: 'Client ID không tồn tại hoặc chưa kết nối giao diện' });
+        SystemLogToConsole('error', 'Nhận IPN nhưng không tìm thấy ClientID hợp lệ. Vui lòng mở Dashboard trước.');
+        return res.status(404).json({ error: 'Client ID không tồn tại. Vui lòng mở Dashboard trước.' });
+    }
+    
+    const activeUICount = session.sseClients.length;
+    if (activeUICount === 0) {
+        SystemLogToConsole('info', `Nhận IPN cho session ${clientId} nhưng UI đang offline. Sẽ buffer và phát lại khi UI reconnect.`, null, clientId);
     }
 
     try {
-        emitLogToUI(clientId, 'info', '--- CÓ HTTP POST REQUEST MỚI ĐẾN WEBHOOK CỦA BẠN ---');
-        let payload = req.body.payload || req.body.data;
-
-        if (!payload) {
-            emitLogToUI(clientId, 'error', 'Không tìm thấy tag "payload" hay "data" trong gói tin gửi đến.', req.body);
-            emitRawIPN(clientId, req.body, 'Thiếu Payload');
-            return res.status(400).json({ error: 'Missing Payload' });
+        emitLogToUI(clientId, 'info', `--- CÓ HTTP ${req.method} MỚI TỚI WEBHOOK BẠN ---`);
+        
+        // Smart Payload Extraction (hỗ trợ nhiều định dạng và cả GET Request)
+        let payload = null;
+        let dataBaggage = req.method === 'GET' ? req.query : req.body;
+        
+        if (typeof dataBaggage === 'string') {
+            const rawBodyStr = dataBaggage.trim();
+            // Dùng Regex moi cái mảng HEX hoặc Base64 dài
+            const match = rawBodyStr.match(/[a-fA-F0-9\-]{40,}|[A-Za-z0-9+/=]{40,}/);
+            payload = match ? match[0] : rawBodyStr;
+            if (payload) SystemLogToConsole('info', 'Phát hiện payload từ raw text body.', payload, clientId);
+        } else if (dataBaggage && typeof dataBaggage === 'object') {
+            // Ưu tiên các field chuẩn
+            payload = dataBaggage.payload || dataBaggage.data || dataBaggage.token || dataBaggage.message || dataBaggage.cipher;
+            
+            if (!payload) {
+                const searchDeep = (obj) => {
+                    for (const k of Object.keys(obj)) {
+                        // Trường hợp 1: Key chính là HEX dài (thường do lỗi parser form-urlencoded khi thiếu dấu =)
+                        if (k.length > 40 && /^[0-9a-fA-F\-]+$/.test(k)) {
+                            SystemLogToConsole('info', 'Phát hiện payload nằm ở KEY của Object (do lỗi parser hoặc đối tác gửi thiếu dấu =).', k, clientId);
+                            return k.trim();
+                        }
+                        // Trường hợp 2: Value là HEX/Base64 dài
+                        const val = obj[k];
+                        if (typeof val === 'string' && val.length > 40) return val.trim();
+                        
+                        // Trường hợp 3: Đệ quy nếu là object nhỏ
+                        if (typeof val === 'object' && val !== null) {
+                            const found = searchDeep(val);
+                            if (found) return found;
+                        }
+                    }
+                    return null;
+                };
+                payload = searchDeep(dataBaggage);
+            }
         }
 
-        emitLogToUI(clientId, 'info', 'Toàn bộ body Request từ đối tác:', req.body, true); 
+        if (!payload) {
+            SystemLogToConsole('error', 'Không tìm thấy bất kỳ chuỗi Encrypted Payload nào trong Request.', dataBaggage, clientId);
+            emitLogToUI(clientId, 'error', 'Không tìm thấy dữ liệu hợp lệ (HEX/Base64/GCM) trong Request. Dashboard không thể tự giải mã.', dataBaggage);
+            emitRawIPN(clientId, dataBaggage, 'Payload Trống/Lỗi');
+            return res.status(400).json({ error: 'Missing Payload', receivedData: dataBaggage });
+        }
+
+        // Loại bỏ các ký tự rác nếu lỗi encode, ví dụ ' ở đầu
+        if (typeof payload === 'string') {
+            payload = payload.trim();
+            if (payload.startsWith("'") && payload.endsWith("'")) payload = payload.slice(1, -1);
+            if (payload.startsWith('"') && payload.endsWith('"')) payload = payload.slice(1, -1);
+        }
+
+        emitLogToUI(clientId, 'info', `Toàn bộ Request từ đối tác (Gửi qua ${req.method}):`, dataBaggage, true); 
 
         let decodedPayload = null;
         let matchedKeyName = '[Chưa rõ nguồn]';
@@ -498,14 +736,18 @@ app.post('/api/simulate-payment', async (req, res) => {
             encryptedText.toString('base64')
         ].join(':');
 
-        const webhookHost = 'http://localhost:' + (process.env.PORT || 3000);
+        const webhookHost = 'http://127.0.0.1:' + (process.env.PORT || 3000);
         const response = await fetch(`${webhookHost}/webhook/ipn/${clientId}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ payload: payloadStr })
         });
         
-        const result = await response.json();
+        // Trong trường hợp IPN endpoint trả về lỗi hoặc parse lỗi do timeout
+        const textResult = await response.text();
+        let result = { message: 'Lỗi parse text response' };
+        try { result = JSON.parse(textResult); } catch(e) {}
+
         res.json({ success: true, payload: payloadStr, serverResponse: result, usedKeyName: targetKeyObj.name });
     } catch(err) {
         res.status(500).json({ error: err.message });

@@ -72,6 +72,8 @@ document.addEventListener('DOMContentLoaded', () => {
     let rawPacketTotal = 0;
     let decryptTotal = 0;
     let tgIsAutoSend = false; // track trạng thái auto-send để tránh gửi 2 lần
+    let isReplayingQueue = false; // Flag: đang replay queue → bắt đầu toạst spam
+    let replayCount = 0;
 
     // ============================
     // TOAST NOTIFICATIONS
@@ -248,7 +250,14 @@ document.addEventListener('DOMContentLoaded', () => {
             if (data.keys && data.keys.length > 0) {
                 keysArray = data.keys;
             } else {
+                // Server vừa restart → chưa có keys → dùng default và auto-save ngay
                 keysArray = [{ id: 'k1', name: 'Mặc định', value: 'VOTRE_SECRET_KEY_32_BYTES_LONG_!', color: '#10b981' }];
+                // Auto-save để server có keys đúng (đồng bộ ID)
+                await fetch('/api/config-keys', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ keys: keysArray, clientId })
+                }).catch(() => {});
             }
             renderKeys();
         } catch(e) {
@@ -278,96 +287,111 @@ document.addEventListener('DOMContentLoaded', () => {
     // ============================
     // SIMULATOR TOGGLE
     // ============================
-    simToggle.addEventListener('click', () => {
-        simBody.classList.toggle('collapsed');
-        simChevron.classList.toggle('open');
-    });
+    if (simToggle) {
+        simToggle.addEventListener('click', () => {
+            if (simBody) simBody.classList.toggle('collapsed');
+            if (simChevron) simChevron.classList.toggle('open');
+        });
+    }
 
     // ============================
     // TELEGRAM PANEL
     // ============================
-    tgToggle.addEventListener('click', () => {
-        tgBody.classList.toggle('collapsed');
-        tgChevron.classList.toggle('open');
-    });
+    if (tgToggle) {
+        tgToggle.addEventListener('click', () => {
+            if (tgBody) tgBody.classList.toggle('collapsed');
+            if (tgChevron) tgChevron.classList.toggle('open');
+        });
+    }
 
     // Load current Telegram status from server
     fetch('/api/telegram-status?clientId=' + clientId).then(r => r.json()).then(data => {
         if (data.configured) {
             tgIsAutoSend = !!data.autoSend;
-            tgStatusBadge.textContent = data.autoSend ? '🟢 Auto-send BậT' : '✅ Đã cấu hình';
-            tgStatusBadge.className = 'badge-tg ' + (data.autoSend ? 'auto-on' : 'configured');
-            tgAutoSend.checked = data.autoSend;
-            if (data.botToken) iptTgToken.value = data.botToken;
-            if (data.chatId) iptTgChatId.value = data.chatId;
+            if (tgStatusBadge) { tgStatusBadge.textContent = data.autoSend ? '🟢 Auto-send BậT' : '✅ Đã cấu hình';
+            tgStatusBadge.className = 'badge-tg ' + (data.autoSend ? 'auto-on' : 'configured'); }
+            if (tgAutoSend) tgAutoSend.checked = data.autoSend;
+            if (data.botToken && iptTgToken) iptTgToken.value = data.botToken;
+            if (data.chatId && iptTgChatId) iptTgChatId.value = data.chatId;
         }
     }).catch(() => {});
 
-    btnTgTest.addEventListener('click', async () => {
-        const token = iptTgToken.value.trim();
-        const chatId = iptTgChatId.value.trim();
-        if (!token || !chatId) { showToast('Nhập Bot Token và Chat ID trước!', 'error'); return; }
-        const orig = btnTgTest.innerHTML;
-        btnTgTest.disabled = true;
-        btnTgTest.innerHTML = '⏳ Đang gửi...';
-        try {
-            const res = await fetch('/api/test-telegram', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ botToken: token, chatId })
-            });
-            const data = await res.json();
-            if (data.success) showToast('✅ Telegram kết nối thành công! Kiểm tra bot của bạn.', 'success', 4000);
-            else showToast('Lỗi: ' + data.error, 'error');
-        } catch(e) { showToast('Lỗi mạng: ' + e.message, 'error'); }
-        finally { btnTgTest.innerHTML = orig; btnTgTest.disabled = false; }
-    });
+    if (btnTgTest) {
+        btnTgTest.addEventListener('click', async () => {
+            const token = iptTgToken ? iptTgToken.value.trim() : '';
+            const chatId = iptTgChatId ? iptTgChatId.value.trim() : '';
+            if (!token || !chatId) { showToast('Nhập Bot Token và Chat ID trước!', 'error'); return; }
+            const orig = btnTgTest.innerHTML;
+            btnTgTest.disabled = true;
+            btnTgTest.innerHTML = '⏳ Đang gửi...';
+            try {
+                const res = await fetch('/api/test-telegram', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ botToken: token, chatId })
+                });
+                const data = await res.json();
+                if (data.success) showToast('✅ Telegram kết nối thành công! Kiểm tra bot của bạn.', 'success', 4000);
+                else showToast('Lỗi: ' + data.error, 'error');
+            } catch(e) { showToast('Lỗi mạng: ' + e.message, 'error'); }
+            finally { btnTgTest.innerHTML = orig; btnTgTest.disabled = false; }
+        });
+    }
 
-    btnTgSave.addEventListener('click', async () => {
-        const token = iptTgToken.value.trim();
-        const chatId = iptTgChatId.value.trim();
-        if (!token || !chatId) { showToast('Vui lòng nhập Bot Token và Chat ID!', 'error'); return; }
-        const orig = btnTgSave.innerHTML;
-        btnTgSave.disabled = true;
-        btnTgSave.innerHTML = '⏳ Đang lưu...';
-        try {
-            const res = await fetch('/api/config-telegram', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ botToken: token, chatId, autoSend: tgAutoSend.checked, clientId })
-            });
-            const data = await res.json();
-            if (data.success) {
-                tgIsAutoSend = tgAutoSend.checked;
-                showToast('🤖 Đã lưu cấu hình Telegram!', 'success');
-                tgStatusBadge.textContent = tgAutoSend.checked ? '🟢 Auto-send BậT' : '✅ Đã cấu hình';
-                tgStatusBadge.className = 'badge-tg ' + (tgAutoSend.checked ? 'auto-on' : 'configured');
-            } else showToast('Lỗi: ' + data.error, 'error');
-        } catch(e) { showToast('Lỗi mạng: ' + e.message, 'error'); }
-        finally { btnTgSave.innerHTML = orig; btnTgSave.disabled = false; }
-    });
+    if (btnTgSave) {
+        btnTgSave.addEventListener('click', async () => {
+            const token = iptTgToken ? iptTgToken.value.trim() : '';
+            const chatId = iptTgChatId ? iptTgChatId.value.trim() : '';
+            if (!token || !chatId) { showToast('Vui lòng nhập Bot Token và Chat ID!', 'error'); return; }
+            const orig = btnTgSave.innerHTML;
+            btnTgSave.disabled = true;
+            btnTgSave.innerHTML = '⏳ Đang lưu...';
+            try {
+                const res = await fetch('/api/config-telegram', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ botToken: token, chatId, autoSend: tgAutoSend ? tgAutoSend.checked : false, clientId })
+                });
+                const data = await res.json();
+                if (data.success) {
+                    tgIsAutoSend = tgAutoSend ? tgAutoSend.checked : false;
+                    showToast('🤖 Đã lưu cấu hình Telegram!', 'success');
+                    if (tgStatusBadge) {
+                        tgStatusBadge.textContent = (tgAutoSend && tgAutoSend.checked) ? '🟢 Auto-send BậT' : '✅ Đã cấu hình';
+                        tgStatusBadge.className = 'badge-tg ' + ((tgAutoSend && tgAutoSend.checked) ? 'auto-on' : 'configured');
+                    }
+                } else showToast('Lỗi: ' + data.error, 'error');
+            } catch(e) { showToast('Lỗi mạng: ' + e.message, 'error'); }
+            finally { btnTgSave.innerHTML = orig; btnTgSave.disabled = false; }
+        });
+    }
 
-    tgAutoSend.addEventListener('change', () => {
-        // Visual feedback only — actual save on btnTgSave click
-        tgStatusBadge.textContent = tgAutoSend.checked ? '🟢 Auto-send BậT' : '✅ Đã cấu hình';
-    });
+    if (tgAutoSend) {
+        tgAutoSend.addEventListener('change', () => {
+            if (tgStatusBadge) tgStatusBadge.textContent = tgAutoSend.checked ? '🟢 Auto-send BậT' : '✅ Đã cấu hình';
+        });
+    }
 
     // ============================
     // CLEAR BUTTONS
     // ============================
-    btnClearRaw.addEventListener('click', () => {
-        rawFeed.innerHTML = '';
-        rawPacketTotal = 0;
-        packetCount.textContent = '0 gói';
-        rawFeed.appendChild(createEmptyState('📡', 'Đang chờ dữ liệu từ đối tác...', 'Webhook sẽ tự động hiển thị tại đây'));
-    });
+    if (btnClearRaw) {
+        btnClearRaw.addEventListener('click', () => {
+            rawFeed.innerHTML = '';
+            rawPacketTotal = 0;
+            if (packetCount) packetCount.textContent = '0 gói';
+            rawFeed.appendChild(createEmptyState('📡', 'Đang chờ dữ liệu từ đối tác...', 'Webhook sẽ tự động hiển thị tại đây'));
+        });
+    }
 
-    btnClearDecrypt.addEventListener('click', () => {
-        decryptContent.innerHTML = '';
-        decryptTotal = 0;
-        decryptCount.textContent = '0 field';
-        decryptContent.appendChild(createEmptyState('🔓', 'Chưa có thông tin nào được giải mã', 'Nhấn nút "Giải Mã" trên từng field ở bên trái'));
-    });
+    if (btnClearDecrypt) {
+        btnClearDecrypt.addEventListener('click', () => {
+            if (decryptContent) decryptContent.innerHTML = '';
+            decryptTotal = 0;
+            if (decryptCount) decryptCount.textContent = '0 field';
+            if (decryptContent) decryptContent.appendChild(createEmptyState('🔓', 'Chưa có thông tin nào được giải mã', 'Nhấn nút "Giải Mã" trên từng field ở bên trái'));
+        });
+    }
 
     function createEmptyState(icon, title, sub) {
         const div = document.createElement('div');
@@ -379,23 +403,29 @@ document.addEventListener('DOMContentLoaded', () => {
     // ============================
     // PARSE RAW JSON INPUT (manual paste)
     // ============================
-    btnParseRaw.addEventListener('click', () => {
-        const raw = rawJsonInput.value.trim();
-        if (!raw) { showToast('Vui lòng dán JSON body vào ô!', 'error'); return; }
+    if (btnParseRaw) {
+        btnParseRaw.addEventListener('click', () => {
+            const raw = rawJsonInput ? rawJsonInput.value.trim() : '';
+            if (!raw) { showToast('Vui lòng dán JSON body vào ô!', 'error'); return; }
 
-        let bodyObj;
-        try { bodyObj = JSON.parse(raw); }
-        catch (e) { showToast('JSON không hợp lệ: ' + e.message, 'error'); return; }
+            let bodyObj;
+            try { bodyObj = JSON.parse(raw); }
+            catch (e) { showToast('JSON không hợp lệ: ' + e.message, 'error'); return; }
 
-        addRawPacket(bodyObj, 'Dán thủ công');
-        rawJsonInput.value = '';
-        showToast('Đã phân tích JSON thành công!', 'success');
-    });
+            addRawPacket(bodyObj, 'Dán thủ công');
+            if (rawJsonInput) rawJsonInput.value = '';
+            showToast('Đã phân tích JSON thành công!', 'success');
+        });
+    }
 
     // ============================
     // ADD RAW PACKET CARD
     // ============================
     function addRawPacket(bodyObj, source = 'Webhook', matchedName = '', matchedColor = '#10b981', matchedId = 'unmatched') {
+        if (typeof bodyObj === 'string' || typeof bodyObj !== 'object' || bodyObj === null) {
+            bodyObj = { data: String(bodyObj) };
+        }
+
         // Remove empty state
         const emptyEl = rawFeed.querySelector('.empty-state');
         if (emptyEl) emptyEl.remove();
@@ -428,25 +458,34 @@ document.addEventListener('DOMContentLoaded', () => {
         card.appendChild(meta);
         card.appendChild(fields);
 
-        // Hide immediately if not active tab
-        if (currentActiveTab && matchedId !== currentActiveTab) {
+        rawFeed.prepend(card);
+
+        // Badge Facebook-style: ẩn card nếu không phải tab đang xem
+        // Badge số chỉ biến mất khi người dùng bấm vào tab đó
+        if (matchedId && matchedId !== currentActiveTab) {
             card.style.display = 'none';
             unreadCounts[matchedId] = (unreadCounts[matchedId] || 0) + 1;
-            
+
             if (feedTabsContainer) {
                 const tabBtn = feedTabsContainer.querySelector(`.feed-tab[data-tab-id="${matchedId}"]`);
                 if (tabBtn) {
-                    const badge = tabBtn.querySelector('.badge-unread');
-                    if (badge) {
-                        badge.textContent = unreadCounts[matchedId];
-                        badge.style.display = '';
+                    let badge = tabBtn.querySelector('.badge-unread');
+                    if (!badge) {
+                        badge = document.createElement('span');
+                        badge.className = 'badge-unread';
+                        tabBtn.appendChild(badge);
                     }
+                    badge.textContent = unreadCounts[matchedId];
+                    badge.style.display = 'inline-flex';
+                    // Pulse animation mỗi khi có IPN mới
+                    badge.classList.remove('badge-pop');
+                    void badge.offsetWidth; // force reflow
+                    badge.classList.add('badge-pop');
                 }
             }
+        } else {
+            rawFeed.scrollTo({ top: 0, behavior: 'smooth' });
         }
-
-        rawFeed.prepend(card);
-        rawFeed.scrollTo({ top: 0, behavior: 'smooth' });
 
         const allCards = rawFeed.querySelectorAll(`.raw-packet[data-tab-id="${matchedId}"]`);
         if (allCards.length > 50) {
@@ -624,7 +663,7 @@ document.addEventListener('DOMContentLoaded', () => {
         if (emptyEl) emptyEl.remove();
 
         decryptTotal++;
-        decryptCount.textContent = decryptTotal + ' field';
+        if (decryptCount) decryptCount.textContent = decryptTotal + ' field';
 
         const card = document.createElement('div');
         card.className = 'decrypt-card';
@@ -768,26 +807,187 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     // ============================
-    // SSE: LIVE WEBHOOK FEED
+    // SSE + HTTP POLLING: LIVE WEBHOOK FEED
+    // Dual strategy: SSE làm primary, HTTP polling làm fallback
     // ============================
-    const eventSource = new EventSource('/api/events?clientId=' + clientId);
+    const serverStatus = document.getElementById('serverStatus');
+    let eventSource = null;
+    let reconnectTimeout = null;
+    let lastSeenEventId = null;        // ID của event cuối đã xử lý (dùng cho polling)
+    let processedEventIds = new Set(); // Tránh render trùng event
+    const MAX_DEDUP_SIZE = 500;
 
-    eventSource.onmessage = function(event) {
-        try {
-            const payload = JSON.parse(event.data);
-            // Only handle events that contain raw body data from webhook
-            if (payload.type === 'raw_ipn' && payload.rawBody) {
-                addRawPacket(payload.rawBody, 'Webhook IPN', payload.matchedKeyName || '', payload.matchedKeyColor || '#10b981', payload.matchedKeyId || 'unmatched');
-            }
-            // Still handle text logs for debug
-        } catch(e) {
-            console.warn('SSE parse error:', e);
+    function updateConnectionStatus(status) {
+        if (!serverStatus) return;
+        const dot = serverStatus.querySelector('.dot');
+        const text = serverStatus.querySelector('span:not(.dot)');
+        
+        if (status === 'connected') {
+            serverStatus.className = 'status-badge pulse';
+            text.textContent = 'Trực tuyến (Live)';
+        } else if (status === 'connecting') {
+            serverStatus.className = 'status-badge connecting';
+            text.textContent = 'Đang kết nối...';
+        } else {
+            serverStatus.className = 'status-badge disconnected';
+            text.textContent = 'Mất kết nối (Đang dùng Polling)';
         }
-    };
+    }
 
-    eventSource.onerror = function() {
-        console.warn('SSE disconnected, retrying...');
-    };
+    // Hàm xử lý một event (dùng chung cho cả SSE và Polling)
+    function handleIncomingEvent(payload, source = 'SSE') {
+        if (!payload || !payload.type) return;
+
+        // Deduplication: bỏ qua nếu đã xử lý event này
+        const eventId = String(payload.id || '');
+        if (eventId && processedEventIds.has(eventId)) return;
+        if (eventId) {
+            processedEventIds.add(eventId);
+            // Giữ set không quá lớn
+            if (processedEventIds.size > MAX_DEDUP_SIZE) {
+                const first = processedEventIds.values().next().value;
+                processedEventIds.delete(first);
+            }
+        }
+
+        // Cập nhật lastSeenEventId
+        if (eventId) lastSeenEventId = eventId;
+
+        // Phát hiện thông báo replay queue từ server
+        if (payload.type === 'success' && payload.message && payload.message.includes('phát lại')) {
+            isReplayingQueue = true;
+            replayCount = 0;
+            showToast(payload.message, 'info', 4000);
+            return;
+        }
+
+        // Xử lý logs hệ thống — chỉ show toast cho messages quan trọng với người dùng
+        // Lọc bỏ: DEBUG nội bộ, HTTP arrival log, heartbeat, key config confirmations
+        if (payload.type === 'info' || payload.type === 'success' || payload.type === 'error') {
+            const msg = payload.message || '';
+            const isInternalNoise = (
+                msg.includes('DEBUG') ||
+                msg.includes('CÓ HTTP') ||
+                msg.includes('Toàn bộ Request') ||
+                msg.includes('Phát hiện payload') ||
+                msg.includes('Chuyển hướng') ||
+                msg.includes('Nhận IPN') ||
+                msg.includes('🔑 Đã cập nhật')
+            );
+            if (!isInternalNoise && !isReplayingQueue) {
+                showToast(msg, payload.type);
+            }
+        }
+
+        // Xử lý gói tin Webhook thô — đây là event quan trọng nhất
+        if (payload.type === 'raw_ipn' && payload.rawBody) {
+            console.log(`[${source}] Hiển thị Raw IPN lên feed...`, payload);
+            if (isReplayingQueue) replayCount++;
+            addRawPacket(
+                payload.rawBody,
+                'Webhook IPN',
+                payload.matchedKeyName || '',
+                payload.matchedKeyColor || '#10b981',
+                payload.matchedKeyId || 'unmatched'
+            );
+
+            if (isReplayingQueue) {
+                clearTimeout(window._replayEndTimer);
+                window._replayEndTimer = setTimeout(() => {
+                    if (replayCount > 0) {
+                        showToast(`↩ Đã phục hồi ${replayCount} IPN bị miss!`, 'success', 5000);
+                    }
+                    isReplayingQueue = false;
+                    replayCount = 0;
+                }, 600);
+            }
+        }
+    }
+
+    function initSSE() {
+        if (eventSource) {
+            eventSource.close();
+        }
+
+        console.log(`[SSE] Cố gắng kết nối với ID: ${clientId}`);
+        updateConnectionStatus('connecting');
+
+        eventSource = new EventSource('/api/events?clientId=' + clientId);
+
+        eventSource.onopen = () => {
+            console.log('[SSE] Kết nối được thiết lập.');
+            updateConnectionStatus('connected');
+            if (reconnectTimeout) {
+                clearTimeout(reconnectTimeout);
+                reconnectTimeout = null;
+            }
+        };
+
+        eventSource.onmessage = function(event) {
+            try {
+                if (!event.data || event.data === ': heartbeat') return;
+                const payload = JSON.parse(event.data);
+                console.log(`[SSE] Nhận:`, payload.type, payload.id || '');
+                handleIncomingEvent(payload, 'SSE');
+            } catch(e) {
+                console.warn('[SSE] Lỗi parse:', e, event.data);
+            }
+        };
+
+        eventSource.onerror = function(err) {
+            console.error('[SSE] Lỗi kết nối:', err);
+            updateConnectionStatus('disconnected');
+            eventSource.close();
+            
+            if (!reconnectTimeout) {
+                reconnectTimeout = setTimeout(() => {
+                    reconnectTimeout = null;
+                    initSSE();
+                }, 3000);
+            }
+        };
+    }
+
+    // ============================
+    // HTTP POLLING FALLBACK (mỗi 2.5 giây)
+    // Đây là cơ chế dự phòng đảm bảo KHÔNG bao giờ miss IPN
+    // ============================
+    let pollFailCount = 0;
+
+    async function pollEvents() {
+        try {
+            const url = `/api/poll-events?clientId=${clientId}${lastSeenEventId ? '&since=' + encodeURIComponent(lastSeenEventId) : ''}`;
+            const res = await fetch(url, { signal: AbortSignal.timeout(5000) });
+            if (!res.ok) return;
+
+            const data = await res.json();
+            pollFailCount = 0;
+
+            if (data.events && data.events.length > 0) {
+                console.log(`[POLL] Nhận ${data.events.length} events mới từ server (SSE clients: ${data.sseClients})`);
+                data.events.forEach(evt => handleIncomingEvent(evt, 'POLL'));
+
+                // Cập nhật status nếu đang disconnect nhưng polling hoạt động
+                if (serverStatus && serverStatus.classList.contains('disconnected')) {
+                    updateConnectionStatus('connected');
+                }
+            }
+        } catch(e) {
+            pollFailCount++;
+            if (pollFailCount > 5) {
+                console.warn('[POLL] Nhiều lần thất bại:', e.message);
+            }
+        }
+    }
+
+    // Khởi tạo SSE connection lần đầu
+    initSSE();
+
+    // Bắt đầu polling sau 1 giây (để SSE có cơ hội kết nối trước)
+    setTimeout(() => {
+        pollEvents(); // Poll ngay lần đầu để lấy events đã bị miss
+        setInterval(pollEvents, 2500); // Sau đó poll mỗi 2.5 giây
+    }, 1000);
 
     // ============================
     // SIMULATOR: SHOOT WEBHOOK
@@ -848,9 +1048,10 @@ document.addEventListener('DOMContentLoaded', () => {
             const result = await res.json();
 
             if (result.success && result.payload) {
-                // Show raw packet in left panel immediately
-                addRawPacket({ payload: result.payload }, 'Simulator');
-                showToast('Đã bắn Webhook thành công! Xem bên trái.', 'success');
+                showToast('🚀 Đã bắn Webhook! Đang chờ nhận dữ liệu...', 'success');
+                // Poll ngay lập tức sau khi bắn để lấy kết quả (không cần chờ interval)
+                setTimeout(() => pollEvents(), 300);
+                setTimeout(() => pollEvents(), 1200);
             }
         } catch (err) {
             showToast('Lỗi: ' + err.message, 'error');
