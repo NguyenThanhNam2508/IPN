@@ -1,0 +1,13 @@
+{
+  "name": "ipn-webhook-server",
+  "version": "1.0.0",
+  "description": "Secure API endpoint for receiving encrypted IPN webhooks",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test-webhook": "node test_webhook.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}
