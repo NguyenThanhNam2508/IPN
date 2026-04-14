@@ -234,7 +234,10 @@ document.addEventListener('DOMContentLoaded', () => {
             });
             const data = await res.json();
             if (!res.ok) showToast('Lỗi: ' + data.error, 'error');
-            else showToast('Đã lưu cấu hình danh sách Key thành công!', 'success');
+            else {
+                showToast('Đã lưu cấu hình danh sách Key thành công!', 'success');
+                await reevaluateAllPackets();
+            }
         } catch (err) {
             showToast('Lỗi mạng: ' + err.message, 'error');
         } finally {
@@ -242,6 +245,50 @@ document.addEventListener('DOMContentLoaded', () => {
             btnSaveKeys.disabled = false;
         }
     });
+
+    async function reevaluateAllPackets() {
+        showToast('Đang phân tích lại các gói tin cũ với cấu hình Key mới...', 'info');
+        let savedRawPackets = JSON.parse(localStorage.getItem('ipn_rawPackets') || '[]');
+        if (savedRawPackets.length === 0) return;
+
+        try {
+            const res = await fetch('/api/reevaluate-packets', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ packets: savedRawPackets.map(p => p.bodyObj), clientId })
+            });
+            const data = await res.json();
+            if (data.results) {
+                // Update `savedRawPackets`
+                data.results.forEach((r, i) => {
+                    savedRawPackets[i].matchedName = r.matchedName;
+                    savedRawPackets[i].matchedColor = r.matchedColor;
+                    savedRawPackets[i].matchedId = r.matchedId;
+                });
+                localStorage.setItem('ipn_rawPackets', JSON.stringify(savedRawPackets));
+                
+                // Clear UI
+                rawFeed.innerHTML = '';
+                rawPacketTotal = 0;
+                if (packetCount) packetCount.textContent = '0 gói';
+                unreadCounts = {}; // Reset unread counts
+                const emptyEl = rawFeed.querySelector('.empty-state');
+                if (emptyEl) emptyEl.remove();
+                
+                // Rebuild UI
+                for (let i = savedRawPackets.length - 1; i >= 0; i--) {
+                    const p = savedRawPackets[i];
+                    addRawPacket(p.bodyObj, p.source, p.matchedName, p.matchedColor, p.matchedId, p.time, true);
+                }
+                
+                // Keep the current active tab if it still exists
+                renderTabs();
+                showToast('Đã phân tích lại toàn bộ lịch sử IPN!', 'success');
+            }
+        } catch(e) {
+            console.error(e);
+        }
+    }
 
     async function loadKeys() {
         try {
@@ -376,11 +423,20 @@ document.addEventListener('DOMContentLoaded', () => {
     // CLEAR BUTTONS
     // ============================
     if (btnClearRaw) {
-        btnClearRaw.addEventListener('click', () => {
+        btnClearRaw.addEventListener('click', async () => {
             rawFeed.innerHTML = '';
             rawPacketTotal = 0;
             if (packetCount) packetCount.textContent = '0 gói';
             rawFeed.appendChild(createEmptyState('📡', 'Đang chờ dữ liệu từ đối tác...', 'Webhook sẽ tự động hiển thị tại đây'));
+            localStorage.removeItem('ipn_rawPackets');
+            localStorage.removeItem('ipn_lastSeenEventId');
+            try {
+                await fetch('/api/clear-events', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ clientId })
+                });
+            } catch(e) { console.error('Lỗi khi xóa queue backend:', e); }
         });
     }
 
@@ -421,7 +477,7 @@ document.addEventListener('DOMContentLoaded', () => {
     // ============================
     // ADD RAW PACKET CARD
     // ============================
-    function addRawPacket(bodyObj, source = 'Webhook', matchedName = '', matchedColor = '#10b981', matchedId = 'unmatched') {
+    function addRawPacket(bodyObj, source = 'Webhook', matchedName = '', matchedColor = '#10b981', matchedId = 'unmatched', timeStr = null, isRestore = false) {
         if (typeof bodyObj === 'string' || typeof bodyObj !== 'object' || bodyObj === null) {
             bodyObj = { data: String(bodyObj) };
         }
@@ -436,7 +492,14 @@ document.addEventListener('DOMContentLoaded', () => {
         const card = document.createElement('div');
         card.className = 'raw-packet';
         card.dataset.tabId = matchedId;
-        const time = new Date().toLocaleTimeString();
+        const time = timeStr || new Date().toLocaleTimeString();
+
+        if (!isRestore) {
+            let savedRawPackets = JSON.parse(localStorage.getItem('ipn_rawPackets') || '[]');
+            savedRawPackets.unshift({ bodyObj, source, matchedName, matchedColor, matchedId, time });
+            if (savedRawPackets.length > 50) savedRawPackets.length = 50;
+            localStorage.setItem('ipn_rawPackets', JSON.stringify(savedRawPackets));
+        }
 
         const meta = document.createElement('div');
         meta.className = 'packet-meta';
@@ -658,7 +721,7 @@ document.addEventListener('DOMContentLoaded', () => {
     // ============================
     // ADD DECRYPT RESULT CARD
     // ============================
-    function addDecryptResult(fieldKey, attempt) {
+    function addDecryptResult(fieldKey, attempt, timeStr = null, isRestore = false) {
         const emptyEl = decryptContent.querySelector('.empty-state');
         if (emptyEl) emptyEl.remove();
 
@@ -668,7 +731,7 @@ document.addEventListener('DOMContentLoaded', () => {
         const card = document.createElement('div');
         card.className = 'decrypt-card';
 
-        const time = new Date().toLocaleTimeString();
+        const time = timeStr || new Date().toLocaleTimeString();
 
         // Try parse as JSON
         let parsedData = null;
@@ -744,7 +807,43 @@ document.addEventListener('DOMContentLoaded', () => {
                 }
             });
         }
-        card.querySelector('.decrypt-card-body').appendChild(tgBtn);
+        
+        const copyBtn = document.createElement('button');
+        copyBtn.className = 'btn-send-tg'; // Reuse the same class for styling
+        copyBtn.style.marginLeft = '10px';
+        copyBtn.style.backgroundColor = '#4b5563'; // Custom background
+        copyBtn.innerHTML = `
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+            </svg>
+            Copy
+        `;
+        copyBtn.addEventListener('click', () => {
+            const copyText = parsedData ? JSON.stringify(parsedData, null, 2) : attempt.data;
+            navigator.clipboard.writeText(copyText).then(() => {
+                const origHtml = copyBtn.innerHTML;
+                copyBtn.innerHTML = `
+                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                        <polyline points="20 6 9 17 4 12"/>
+                    </svg>
+                    Đã copy ✓
+                `;
+                copyBtn.style.backgroundColor = '#10b981';
+                setTimeout(() => {
+                    copyBtn.innerHTML = origHtml;
+                    copyBtn.style.backgroundColor = '#4b5563';
+                }, 2000);
+            }).catch(err => {
+                showToast('Lỗi copy: ' + err, 'error');
+            });
+        });
+
+        const actionHtml = document.createElement('div');
+        actionHtml.style.marginTop = '12px';
+        actionHtml.appendChild(tgBtn);
+        actionHtml.appendChild(copyBtn);
+
+        card.querySelector('.decrypt-card-body').appendChild(actionHtml);
 
         decryptContent.appendChild(card);
         decryptContent.scrollTo({ top: decryptContent.scrollHeight, behavior: 'smooth' });
@@ -753,13 +852,13 @@ document.addEventListener('DOMContentLoaded', () => {
     // ============================
     // ADD DECRYPT ERROR CARD
     // ============================
-    function addDecryptError(fieldKey, encryptedValue, analysis) {
+    function addDecryptError(fieldKey, encryptedValue, analysis, timeStr = null, isRestore = false) {
         const emptyEl = decryptContent.querySelector('.empty-state');
         if (emptyEl) emptyEl.remove();
 
         const card = document.createElement('div');
         card.className = 'decrypt-card decrypt-error';
-        const time = new Date().toLocaleTimeString();
+        const time = timeStr || new Date().toLocaleTimeString();
 
         let failDetails = 'Tất cả phương pháp giải mã đều thất bại.';
         if (analysis && analysis.attempts) {
@@ -813,7 +912,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const serverStatus = document.getElementById('serverStatus');
     let eventSource = null;
     let reconnectTimeout = null;
-    let lastSeenEventId = null;        // ID của event cuối đã xử lý (dùng cho polling)
+    let lastSeenEventId = localStorage.getItem('ipn_lastSeenEventId') || null;        // ID của event cuối đã xử lý (dùng cho polling)
     let processedEventIds = new Set(); // Tránh render trùng event
     const MAX_DEDUP_SIZE = 500;
 
@@ -851,7 +950,10 @@ document.addEventListener('DOMContentLoaded', () => {
         }
 
         // Cập nhật lastSeenEventId
-        if (eventId) lastSeenEventId = eventId;
+        if (eventId) {
+            lastSeenEventId = eventId;
+            localStorage.setItem('ipn_lastSeenEventId', lastSeenEventId);
+        }
 
         // Phát hiện thông báo replay queue từ server
         if (payload.type === 'success' && payload.message && payload.message.includes('phát lại')) {
@@ -1080,5 +1182,22 @@ document.addEventListener('DOMContentLoaded', () => {
         s.textContent = `@keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }`;
         document.head.appendChild(s);
     }
+
+    // ============================
+    // RESTORE LOCAL STORAGE DATA
+    // ============================
+    function restoreLocalStorageData() {
+        try {
+            const srRaw = JSON.parse(localStorage.getItem('ipn_rawPackets') || '[]');
+            for (let i = srRaw.length - 1; i >= 0; i--) {
+                const p = srRaw[i];
+                addRawPacket(p.bodyObj, p.source, p.matchedName, p.matchedColor, p.matchedId, p.time, true);
+            }
+        } catch(e) {
+            console.error('Lỗi khi khôi phục dữ liệu từ localStorage', e);
+        }
+    }
+    
+    restoreLocalStorageData();
 
 });

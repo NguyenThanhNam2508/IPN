@@ -273,6 +273,17 @@ app.get('/api/poll-events', (req, res) => {
     });
 });
 
+app.post('/api/clear-events', (req, res) => {
+    const { clientId } = req.body;
+    if (!clientId) return res.status(400).json({ error: 'Thiếu clientId' });
+    const session = getSession(clientId);
+    if (session) {
+        session.pollQueue = [];
+        session.eventQueue = [];
+    }
+    res.json({ success: true });
+});
+
 // -------------------------------------------------------------
 // DEBUG ENDPOINT: Xem trạng thái sessions
 // -------------------------------------------------------------
@@ -341,6 +352,94 @@ app.post('/api/config-keys', (req, res) => {
     session.keys = validKeys;
     emitLogToUI(clientId, 'success', `🔑 Đã cập nhật xong danh sách ${validKeys.length} Secret Key!`);
     res.json({ success: true, count: validKeys.length });
+});
+
+app.post('/api/reevaluate-packets', (req, res) => {
+    const { packets, clientId } = req.body;
+    if (!clientId) return res.status(400).json({ error: 'Thiếu clientId' });
+    const session = getSession(clientId);
+    if (!session) return res.json({ success: true, results: packets.map(() => ({ matchedName: 'Giải mã thất bại', matchedColor: '#ef4444', matchedId: 'unmatched' })) });
+
+    const results = packets.map(dataBaggage => {
+        let payload = null;
+        if (typeof dataBaggage === 'string') {
+            const rawBodyStr = dataBaggage.trim();
+            const match = rawBodyStr.match(/[a-fA-F0-9\-]{40,}|[A-Za-z0-9+/=]{40,}/);
+            payload = match ? match[0] : rawBodyStr;
+        } else if (dataBaggage && typeof dataBaggage === 'object') {
+            payload = dataBaggage.payload || dataBaggage.data || dataBaggage.token || dataBaggage.message || dataBaggage.cipher;
+            if (!payload) {
+                const searchDeep = (obj) => {
+                    for (const k of Object.keys(obj)) {
+                        if (k.length > 40 && /^[0-9a-fA-F\-]+$/.test(k)) return k.trim();
+                        const val = obj[k];
+                        if (typeof val === 'string' && val.length > 40) return val.trim();
+                        if (typeof val === 'object' && val !== null) {
+                            const found = searchDeep(val);
+                            if (found) return found;
+                        }
+                    }
+                    return null;
+                };
+                payload = searchDeep(dataBaggage);
+            }
+        }
+
+        if (typeof payload === 'string') {
+            payload = payload.trim();
+            if (payload.startsWith("'") && payload.endsWith("'")) payload = payload.slice(1, -1);
+            if (payload.startsWith('"') && payload.endsWith('"')) payload = payload.slice(1, -1);
+        }
+
+        let matchedKeyName = '[Chưa rõ nguồn]';
+        let matchedKeyColor = '#ef4444';
+        let matchedKeyId = 'unmatched';
+
+        if (payload) {
+            for (const kObj of session.keys) {
+                try {
+                    const keyBuffer = kObj.buffer;
+                    let decryptedString;
+                    const payloadParts = payload.split(':');
+
+                    if (payloadParts.length === 3) {
+                        const iv = Buffer.from(payloadParts[0], 'base64');
+                        const authTag = Buffer.from(payloadParts[1], 'base64');
+                        const encryptedText = Buffer.from(payloadParts[2], 'base64');
+                        const decipher = crypto.createDecipheriv('aes-256-gcm', keyBuffer, iv);
+                        decipher.setAuthTag(authTag);
+                        decipher.update(encryptedText, undefined, 'utf8');
+                        decipher.final('utf8');
+                        matchedKeyName = kObj.name;
+                        matchedKeyColor = kObj.color || '#10b981';
+                        matchedKeyId = kObj.id;
+                        break;
+                    } else {
+                        const hexPayload = payload.trim();
+                        const iv = Buffer.from(hexPayload.slice(0, 32), 'hex');
+                        const encryptedText = Buffer.from(hexPayload.slice(32), 'hex');
+                        const decipher = crypto.createDecipheriv('aes-256-cbc', keyBuffer, iv);
+                        decipher.setAutoPadding(true);
+                        decipher.update(encryptedText, undefined, 'utf8');
+                        decipher.final('utf8');
+                        matchedKeyName = kObj.name;
+                        matchedKeyColor = kObj.color || '#10b981';
+                        matchedKeyId = kObj.id;
+                        break;
+                    }
+                } catch (err) {}
+            }
+        }
+
+        if (matchedKeyId === 'unmatched') {
+            matchedKeyName = 'Giải mã thất bại';
+            matchedKeyColor = '#ef4444';
+        }
+
+        return { matchedName: matchedKeyName, matchedColor: matchedKeyColor, matchedId: matchedKeyId };
+    });
+
+    res.json({ success: true, results });
 });
 
 // -------------------------------------------------------------
