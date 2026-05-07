@@ -55,7 +55,7 @@ ngrok http 3000
 ```
 Ngrok sẽ cung cấp cho bạn một đường Link có dạnh `https://xxxxxx.ngrok.app`. Lúc này, bạn chép link đó rồi cộng thêm nhánh Endpoint Webhook cá nhân của bạn (Lấy ở dòng sáng nhất trên Website Dashboard).
 
-Ví dụ bạn gửi cho cổng thanh toán là: **`https://abcd-efgh.ngrok.app/webhook/ipn/9c24b17f...`**
+Ví dụ bạn gửi cho cổng thanh toán là: **`https://abcd-efgh.ngrok.app/9c24b17f...`**
 
 ---
 

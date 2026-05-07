@@ -445,25 +445,42 @@ app.post('/api/reevaluate-packets', (req, res) => {
 // -------------------------------------------------------------
 // ENDPOINT IPN CHÍNH THỨC (AUTO DECRYPT VỚI NHIỀU KEY & GẮN TAG)
 // -------------------------------------------------------------
+
+// Route phục vụ Dashboard UI thông qua URL ngắn: /clientId
+app.get('/:clientId', (req, res, next) => {
+    // Bỏ qua các API hoặc request gọi file tĩnh
+    if (req.path.startsWith('/api/') || req.path.includes('.')) return next();
+    
+    // Nếu browser yêu cầu HTML, trả về giao diện Dashboard
+    if (req.accepts('html') && !req.xhr) {
+        return res.sendFile(path.join(__dirname, 'public', 'index.html'));
+    }
+    // Ngược lại, chuyển cho Webhook Handler ở dưới
+    next();
+});
+
 // Hỗ trợ dự phòng thông minh (Auto-Fallback) cho các đường dẫn lạ
 app.use((req, res, next) => {
     if (req.method !== 'POST' && req.method !== 'GET') return next();
     if (req.path.startsWith('/api/') || req.path.startsWith('/webhook/ipn')) return next();
 
+    // Loại trừ request HTML từ browser (sẽ do app.get('/:clientId') hoặc static xử lý)
+    if (req.method === 'GET' && req.accepts('html') && !req.xhr) return next();
+
     const activeClients = Array.from(sessions.keys()).filter(id => sessions.get(id).sseClients.length > 0);
     if (activeClients.length > 0) {
         const liveClientId = activeClients[0];
-        // Bẻ lái mọi đường dẫn Callback/IPN lạ (vd: /callback, /, /ipn)
+        // Bẻ lái mọi đường dẫn Callback/IPN lạ (vd: /callback, /ipn)
         if (!req.path.includes('.') && req.path !== '/index.html' && req.path !== '/favicon.ico') {
-            SystemLogToConsole('info', `Chuyển hướng ngầm IPN từ path lạ: ${req.path} -> /webhook/ipn/${liveClientId}`);
-            req.url = `/webhook/ipn/${liveClientId}`;
+            SystemLogToConsole('info', `Chuyển hướng ngầm IPN từ path lạ: ${req.path} -> /${liveClientId}`);
+            req.url = `/${liveClientId}`;
         }
     }
     next();
 });
 
-// Chấp nhận cả /webhook/ipn (không ID) và /webhook/ipn/:clientId
-app.all(['/webhook/ipn', '/webhook/ipn/:clientId'], (req, res) => {
+// Chấp nhận URL ngắn (/:clientId) và các đường dẫn cũ
+app.all(['/:clientId', '/webhook/ipn', '/webhook/ipn/:clientId'], (req, res) => {
     let clientId = req.params.clientId;
     
     // Nếu không có ID trên URL, tìm Client đang mở Dashboard gần nhất

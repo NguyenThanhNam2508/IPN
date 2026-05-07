@@ -27,9 +27,11 @@ document.addEventListener('DOMContentLoaded', () => {
     const btnCopyUrl    = document.getElementById('btnCopyUrl');
 
     // --- Session ID Initialization ---
-    // Extract ID from hash or generate a new one
-    let clientId = window.location.hash.substring(1);
-    if (!clientId) {
+    // Extract ID from path or hash
+    let pathId = window.location.pathname.substring(1).replace(/\/$/, "");
+    let clientId = pathId || window.location.hash.substring(1);
+
+    if (!clientId || clientId.includes('.')) {
         if (window.crypto && window.crypto.randomUUID) {
             clientId = window.crypto.randomUUID();
         } else {
@@ -38,11 +40,16 @@ document.addEventListener('DOMContentLoaded', () => {
                 return v.toString(16);
             });
         }
-        window.location.hash = clientId;
+        window.location.replace('/' + clientId);
+        return;
+    }
+
+    if (!pathId && window.location.hash) {
+        window.history.replaceState(null, '', '/' + clientId);
     }
 
     // Set Webhook URL to Display
-    const uniqueUrl = `${window.location.origin}/webhook/ipn/${clientId}`;
+    const uniqueUrl = `${window.location.origin}/${clientId}`;
     if (iptUniqueUrl) iptUniqueUrl.value = uniqueUrl;
 
     if (btnCopyUrl) {
