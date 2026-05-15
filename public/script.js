@@ -194,7 +194,12 @@ document.addEventListener('DOMContentLoaded', () => {
                 <div class="form-group">
                     <label>Giá trị Secret Key <span class="label-note">(32 chars r 64 hex)</span></label>
                     <div style="display:flex; align-items:center; gap: 0.5rem;">
-                        <input type="text" class="key-input" data-field="value" value="${escapeHtml(k.value)}" placeholder="Nhập key..." autocomplete="off" style="flex:1;">
+                        <div style="position:relative; flex:1; display:flex;">
+                            <input type="password" class="key-input" data-field="value" value="${escapeHtml(k.value)}" placeholder="Nhập key..." autocomplete="off" style="flex:1; padding-right: 36px; width: 100%;">
+                            <button type="button" class="btn-toggle-visibility" tabindex="-1" style="position: absolute; right: 8px; top: 50%; transform: translateY(-50%); background: none; border: none; color: var(--text-dim); cursor: pointer; padding: 4px;" title="Hiện/Ẩn Key">
+                                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+                            </button>
+                        </div>
                         <span class="key-hint ${hintClass}" style="min-width: 70px;">${hintText}</span>
                     </div>
                 </div>
@@ -207,10 +212,24 @@ document.addEventListener('DOMContentLoaded', () => {
             const colorInput = document.createElement('input'); // fake for logic
             inputs[0].addEventListener('input', (e) => { keysArray[index].color = e.target.value; });
             inputs[1].addEventListener('input', (e) => { keysArray[index].name = e.target.value; updateSimKeySelect(); });
-            inputs[2].addEventListener('input', (e) => { keysArray[index].value = e.target.value; renderKeys(); });
+            inputs[2].addEventListener('input', (e) => { keysArray[index].value = e.target.value; saveKeysToLocal(keysArray); renderKeys(); });
             
+            const toggleBtn = row.querySelector('.btn-toggle-visibility');
+            if (toggleBtn) {
+                toggleBtn.addEventListener('click', () => {
+                    if (inputs[2].type === 'password') {
+                        inputs[2].type = 'text';
+                        toggleBtn.innerHTML = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>';
+                    } else {
+                        inputs[2].type = 'password';
+                        toggleBtn.innerHTML = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>';
+                    }
+                });
+            }
+
             row.querySelector('.btn-remove-key').addEventListener('click', () => {
                 keysArray.splice(index, 1);
+                saveKeysToLocal(keysArray);
                 renderKeys();
                 updateSimKeySelect();
                 renderTabs();
@@ -232,6 +251,8 @@ document.addEventListener('DOMContentLoaded', () => {
         const orig = btnSaveKeys.innerHTML;
         btnSaveKeys.disabled = true;
         btnSaveKeys.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg> Đang lưu...';
+
+        saveKeysToLocal(keysArray);
 
         try {
             const res = await fetch('/api/config-keys', {
@@ -297,27 +318,82 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     }
 
+    // ============================
+    // LOCAL STORAGE ENCRYPTION HELPERS
+    // ============================
+    function encryptLocal(dataObj) {
+        try {
+            const jsonStr = JSON.stringify(dataObj);
+            const b64 = btoa(encodeURIComponent(jsonStr));
+            return b64.split('').reverse().map(c => String.fromCharCode(c.charCodeAt(0) + 1)).join('');
+        } catch(e) { return ''; }
+    }
+
+    function decryptLocal(encryptedStr) {
+        try {
+            const reversedB64 = encryptedStr.split('').map(c => String.fromCharCode(c.charCodeAt(0) - 1)).reverse().join('');
+            return JSON.parse(decodeURIComponent(atob(reversedB64)));
+        } catch(e) { return null; }
+    }
+
+    function saveKeysToLocal(keys) {
+        const encrypted = encryptLocal(keys);
+        if (encrypted) {
+            localStorage.setItem('ipn_secretKeys_' + clientId, encrypted);
+        }
+    }
+
+    function loadKeysFromLocal() {
+        const encrypted = localStorage.getItem('ipn_secretKeys_' + clientId);
+        if (encrypted) {
+            return decryptLocal(encrypted);
+        }
+        return null;
+    }
+
     async function loadKeys() {
+        let serverKeys = [];
+        let isDefaultServer = false;
+
         try {
             const res = await fetch('/api/config-keys?clientId=' + clientId);
             const data = await res.json();
             if (data.keys && data.keys.length > 0) {
-                keysArray = data.keys;
+                serverKeys = data.keys;
+                if (serverKeys.length === 1 && serverKeys[0].id === 'default') {
+                    isDefaultServer = true;
+                }
             } else {
-                // Server vừa restart → chưa có keys → dùng default và auto-save ngay
-                keysArray = [{ id: 'k1', name: 'Mặc định', value: 'VOTRE_SECRET_KEY_32_BYTES_LONG_!', color: '#10b981' }];
-                // Auto-save để server có keys đúng (đồng bộ ID)
+                isDefaultServer = true;
+            }
+        } catch(e) {
+            isDefaultServer = true;
+        }
+
+        const localKeys = loadKeysFromLocal();
+
+        // Nếu server bị reset (chỉ có default) và dưới local có key -> ưu tiên local
+        if (isDefaultServer && localKeys && localKeys.length > 0) {
+            keysArray = localKeys;
+            // Đồng bộ lại local lên server ngay
+            try {
                 await fetch('/api/config-keys', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ keys: keysArray, clientId })
-                }).catch(() => {});
-            }
-            renderKeys();
-        } catch(e) {
+                });
+            } catch(e) {}
+        } else if (serverKeys.length > 0 && !isDefaultServer) {
+            // Server có cấu hình chuẩn -> Lấy server, đè xuống local
+            keysArray = serverKeys;
+            saveKeysToLocal(keysArray);
+        } else if (localKeys && localKeys.length > 0) {
+            keysArray = localKeys;
+        } else {
             keysArray = [{ id: 'k1', name: 'Mặc định', value: 'VOTRE_SECRET_KEY_32_BYTES_LONG_!', color: '#10b981' }];
-            renderKeys();
         }
+        
+        renderKeys();
     }
 
     function updateSimKeySelect() {
