@@ -212,7 +212,7 @@ document.addEventListener('DOMContentLoaded', () => {
             const colorInput = document.createElement('input'); // fake for logic
             inputs[0].addEventListener('input', (e) => { keysArray[index].color = e.target.value; });
             inputs[1].addEventListener('input', (e) => { keysArray[index].name = e.target.value; updateSimKeySelect(); });
-            inputs[2].addEventListener('input', (e) => { keysArray[index].value = e.target.value; saveKeysToLocal(keysArray); renderKeys(); });
+            inputs[2].addEventListener('input', (e) => { keysArray[index].value = e.target.value;  renderKeys(); });
             
             const toggleBtn = row.querySelector('.btn-toggle-visibility');
             if (toggleBtn) {
@@ -229,7 +229,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
             row.querySelector('.btn-remove-key').addEventListener('click', () => {
                 keysArray.splice(index, 1);
-                saveKeysToLocal(keysArray);
+                
                 renderKeys();
                 updateSimKeySelect();
                 renderTabs();
@@ -252,7 +252,7 @@ document.addEventListener('DOMContentLoaded', () => {
         btnSaveKeys.disabled = true;
         btnSaveKeys.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg> Đang lưu...';
 
-        saveKeysToLocal(keysArray);
+        
 
         try {
             const res = await fetch('/api/config-keys', {
@@ -275,125 +275,33 @@ document.addEventListener('DOMContentLoaded', () => {
     });
 
     async function reevaluateAllPackets() {
-        showToast('Đang phân tích lại các gói tin cũ với cấu hình Key mới...', 'info');
-        let savedRawPackets = JSON.parse(localStorage.getItem('ipn_rawPackets') || '[]');
-        if (savedRawPackets.length === 0) return;
-
-        try {
-            const res = await fetch('/api/reevaluate-packets', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ packets: savedRawPackets.map(p => p.bodyObj), clientId })
-            });
-            const data = await res.json();
-            if (data.results) {
-                // Update `savedRawPackets`
-                data.results.forEach((r, i) => {
-                    savedRawPackets[i].matchedName = r.matchedName;
-                    savedRawPackets[i].matchedColor = r.matchedColor;
-                    savedRawPackets[i].matchedId = r.matchedId;
-                });
-                localStorage.setItem('ipn_rawPackets', JSON.stringify(savedRawPackets));
-                
-                // Clear UI
-                rawFeed.innerHTML = '';
-                rawPacketTotal = 0;
-                if (packetCount) packetCount.textContent = '0 gói';
-                unreadCounts = {}; // Reset unread counts
-                const emptyEl = rawFeed.querySelector('.empty-state');
-                if (emptyEl) emptyEl.remove();
-                
-                // Rebuild UI
-                for (let i = savedRawPackets.length - 1; i >= 0; i--) {
-                    const p = savedRawPackets[i];
-                    addRawPacket(p.bodyObj, p.source, p.matchedName, p.matchedColor, p.matchedId, p.time, true);
-                }
-                
-                // Keep the current active tab if it still exists
-                renderTabs();
-                showToast('Đã phân tích lại toàn bộ lịch sử IPN!', 'success');
-            }
-        } catch(e) {
-            console.error(e);
-        }
+        // Tải lại toàn bộ IPN từ DB để hiển thị tên/màu mới cập nhật
+        if (rawFeed) rawFeed.innerHTML = '';
+        rawPacketTotal = 0;
+        if (packetCount) packetCount.textContent = '0 gói';
+        await loadIPNs();
     }
 
     // ============================
-    // LOCAL STORAGE ENCRYPTION HELPERS
+    // LOAD KEYS FROM DB
     // ============================
-    function encryptLocal(dataObj) {
-        try {
-            const jsonStr = JSON.stringify(dataObj);
-            const b64 = btoa(encodeURIComponent(jsonStr));
-            return b64.split('').reverse().map(c => String.fromCharCode(c.charCodeAt(0) + 1)).join('');
-        } catch(e) { return ''; }
-    }
-
-    function decryptLocal(encryptedStr) {
-        try {
-            const reversedB64 = encryptedStr.split('').map(c => String.fromCharCode(c.charCodeAt(0) - 1)).reverse().join('');
-            return JSON.parse(decodeURIComponent(atob(reversedB64)));
-        } catch(e) { return null; }
-    }
-
     function saveKeysToLocal(keys) {
-        const encrypted = encryptLocal(keys);
-        if (encrypted) {
-            localStorage.setItem('ipn_secretKeys_' + clientId, encrypted);
-        }
+        // Obsolete
     }
 
-    function loadKeysFromLocal() {
-        const encrypted = localStorage.getItem('ipn_secretKeys_' + clientId);
-        if (encrypted) {
-            return decryptLocal(encrypted);
-        }
-        return null;
-    }
-
-    async function loadKeys() {
-        let serverKeys = [];
-        let isDefaultServer = false;
-
+    async function loadKeys(notify = true) {
         try {
             const res = await fetch('/api/config-keys?clientId=' + clientId);
             const data = await res.json();
-            if (data.keys && data.keys.length > 0) {
-                serverKeys = data.keys;
-                if (serverKeys.length === 1 && serverKeys[0].id === 'default') {
-                    isDefaultServer = true;
-                }
-            } else {
-                isDefaultServer = true;
+            keysArray = data.keys || [];
+            if (keysArray.length === 0) {
+                keysArray = [{ id: 'k1', name: 'Mặc định', value: 'VOTRE_SECRET_KEY_32_BYTES_LONG_!', color: '#10b981' }];
             }
+            renderKeys();
+            if (notify) console.log("Loaded keys from DB.");
         } catch(e) {
-            isDefaultServer = true;
+            console.error("Lỗi load keys:", e);
         }
-
-        const localKeys = loadKeysFromLocal();
-
-        // Nếu server bị reset (chỉ có default) và dưới local có key -> ưu tiên local
-        if (isDefaultServer && localKeys && localKeys.length > 0) {
-            keysArray = localKeys;
-            // Đồng bộ lại local lên server ngay
-            try {
-                await fetch('/api/config-keys', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ keys: keysArray, clientId })
-                });
-            } catch(e) {}
-        } else if (serverKeys.length > 0 && !isDefaultServer) {
-            // Server có cấu hình chuẩn -> Lấy server, đè xuống local
-            keysArray = serverKeys;
-            saveKeysToLocal(keysArray);
-        } else if (localKeys && localKeys.length > 0) {
-            keysArray = localKeys;
-        } else {
-            keysArray = [{ id: 'k1', name: 'Mặc định', value: 'VOTRE_SECRET_KEY_32_BYTES_LONG_!', color: '#10b981' }];
-        }
-        
-        renderKeys();
     }
 
     function updateSimKeySelect() {
@@ -511,7 +419,7 @@ document.addEventListener('DOMContentLoaded', () => {
             rawPacketTotal = 0;
             if (packetCount) packetCount.textContent = '0 gói';
             rawFeed.appendChild(createEmptyState('📡', 'Đang chờ dữ liệu từ đối tác...', 'Webhook sẽ tự động hiển thị tại đây'));
-            localStorage.removeItem('ipn_rawPackets');
+            // localStorage.removeItem('ipn_rawPackets');
             localStorage.removeItem('ipn_lastSeenEventId');
             try {
                 await fetch('/api/clear-events', {
@@ -577,12 +485,7 @@ document.addEventListener('DOMContentLoaded', () => {
         card.dataset.tabId = matchedId;
         const time = timeStr || new Date().toLocaleTimeString();
 
-        if (!isRestore) {
-            let savedRawPackets = JSON.parse(localStorage.getItem('ipn_rawPackets') || '[]');
-            savedRawPackets.unshift({ bodyObj, source, matchedName, matchedColor, matchedId, time });
-            if (savedRawPackets.length > 50) savedRawPackets.length = 50;
-            localStorage.setItem('ipn_rawPackets', JSON.stringify(savedRawPackets));
-        }
+        // No longer saving to localStorage. Handled by Server DB.
 
         const meta = document.createElement('div');
         meta.className = 'packet-meta';
@@ -1064,6 +967,12 @@ document.addEventListener('DOMContentLoaded', () => {
             }
         }
 
+        if (payload.type === 'keys_updated') {
+            loadKeys(false); // tự động reload cấu hình Key mới
+            showToast(payload.message, 'info');
+            return;
+        }
+
         // Xử lý gói tin Webhook thô — đây là event quan trọng nhất
         if (payload.type === 'raw_ipn' && payload.rawBody) {
             console.log(`[${source}] Hiển thị Raw IPN lên feed...`, payload);
@@ -1267,20 +1176,25 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     // ============================
-    // RESTORE LOCAL STORAGE DATA
+    // LOAD IPNS FROM DB
     // ============================
-    function restoreLocalStorageData() {
+    async function loadIPNs() {
         try {
-            const srRaw = JSON.parse(localStorage.getItem('ipn_rawPackets') || '[]');
-            for (let i = srRaw.length - 1; i >= 0; i--) {
-                const p = srRaw[i];
-                addRawPacket(p.bodyObj, p.source, p.matchedName, p.matchedColor, p.matchedId, p.time, true);
+            const res = await fetch('/api/ipns?clientId=' + clientId);
+            const data = await res.json();
+            if (data.ipns) {
+                for (let i = data.ipns.length - 1; i >= 0; i--) {
+                    const p = data.ipns[i];
+                    const timeObj = new Date(p.created_at);
+                    const timeStr = timeObj.toLocaleTimeString('vi-VN');
+                    addRawPacket(p.body_obj, p.source, p.matched_name, p.matched_color, p.matched_id, timeStr, true);
+                }
             }
         } catch(e) {
-            console.error('Lỗi khi khôi phục dữ liệu từ localStorage', e);
+            console.error('Lỗi khi tải lịch sử IPN từ DB', e);
         }
     }
     
-    restoreLocalStorageData();
+    loadIPNs();
 
 });

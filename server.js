@@ -1,6 +1,8 @@
+require('dotenv').config();
 const express = require('express');
 const crypto = require('crypto');
 const path = require('path');
+const { sql } = require('@vercel/postgres');
 
 const app = express();
 app.use(express.json());
@@ -28,26 +30,148 @@ const DEFAULT_SECRET_KEY = Buffer.from('VOTRE_SECRET_KEY_32_BYTES_LONG_!', 'utf-
 const sessions = new Map();
 const MAX_QUEUE_SIZE = 200; // Số sự kiện tối đa lưu buffer
 
+// -------------------------------------------------------------
+// DATABASE ENCRYPTION CẤU HÌNH BẢO MẬT MASTER KEY
+// -------------------------------------------------------------
+const ENCRYPTION_KEY = process.env.MASTER_KEY 
+    ? Buffer.from(process.env.MASTER_KEY.padEnd(32, '0').slice(0, 32)) 
+    : Buffer.from('16052026QCTeamDu_an_IPN'.padEnd(32, '0'));
+const IV_LENGTH = 16;
+
+function encryptDbValue(text) {
+    if (!text) return text;
+    try {
+        const iv = crypto.randomBytes(IV_LENGTH);
+        const cipher = crypto.createCipheriv('aes-256-cbc', ENCRYPTION_KEY, iv);
+        let encrypted = cipher.update(text, 'utf8', 'hex');
+        encrypted += cipher.final('hex');
+        return iv.toString('hex') + ':' + encrypted;
+    } catch (e) {
+        console.error("Lỗi mã hóa db:", e);
+        return text;
+    }
+}
+
+function decryptDbValue(text) {
+    if (!text) return text;
+    const textParts = text.split(':');
+    if (textParts.length !== 2) return text; // Plaintext (chưa mã hóa)
+    try {
+        const iv = Buffer.from(textParts[0], 'hex');
+        const encryptedText = Buffer.from(textParts[1], 'hex');
+        const decipher = crypto.createDecipheriv('aes-256-cbc', ENCRYPTION_KEY, iv);
+        let decrypted = decipher.update(encryptedText, 'hex', 'utf8');
+        decrypted += decipher.final('utf8');
+        return decrypted;
+    } catch (e) {
+        return text; // Lỗi giải mã (sai key hoặc plaintext chứa dấu :)
+    }
+}
+
 function getSession(clientId) {
     if (!clientId) return null;
     if (!sessions.has(clientId)) {
         sessions.set(clientId, {
-            keys: [{ 
-                id: 'default', 
-                name: 'Đối tác Mặc định', 
-                buffer: DEFAULT_SECRET_KEY, 
-                originalStr: 'VOTRE_SECRET_KEY_32_BYTES_LONG_!',
-                color: '#10b981'
-            }],
             tgToken: '',
             tgChatId: '',
             tgAutoSend: false,
             sseClients: [],
-            pollQueue: [],    // Queue cho HTTP Polling (không bị xóa bởi SSE)
-            eventQueue: []    // Queue replay khi UI reconnect SSE
+            pollQueue: [],
+            eventQueue: []
         });
     }
     return sessions.get(clientId);
+}
+
+async function getClientKeys(clientId) {
+    try {
+        const { rows } = await sql`SELECT * FROM client_keys WHERE client_id = ${clientId}`;
+        if (rows.length === 0) {
+            return [{
+                id: 'default',
+                name: 'Đối tác Mặc định',
+                buffer: DEFAULT_SECRET_KEY,
+                originalStr: 'VOTRE_SECRET_KEY_32_BYTES_LONG_!',
+                color: '#10b981'
+            }];
+        }
+        return rows.map(r => {
+            const val = decryptDbValue(r.value).trim();
+            const isHex64 = /^[0-9a-fA-F]{64}$/.test(val);
+            let keyBuf = isHex64 ? Buffer.from(val, 'hex') : Buffer.from(val, 'utf-8');
+            return {
+                id: r.key_id,
+                name: r.name,
+                buffer: keyBuf,
+                originalStr: val,
+                color: r.color
+            };
+        });
+    } catch(e) {
+        console.error("DB Error getClientKeys:", e);
+        return [{ id: 'default', name: 'DB Error', buffer: DEFAULT_SECRET_KEY, originalStr: 'ERROR', color: '#ef4444' }];
+    }
+}
+
+function attemptDecrypt(payload, keyBuffer) {
+    const trimmed = typeof payload === 'string' ? payload.trim() : JSON.stringify(payload);
+    
+    if (trimmed.split(':').length === 3) {
+        try {
+            const parts = trimmed.split(':');
+            const iv = Buffer.from(parts[0], 'base64');
+            const authTag = Buffer.from(parts[1], 'base64');
+            const encryptedText = Buffer.from(parts[2], 'base64');
+            const decipher = crypto.createDecipheriv('aes-256-gcm', keyBuffer, iv);
+            decipher.setAuthTag(authTag);
+            let out = decipher.update(encryptedText, undefined, 'utf8');
+            out += decipher.final('utf8');
+            JSON.parse(out); 
+            return { decrypted: out, method: 'AES-256-GCM' };
+        } catch(e) {}
+    }
+
+    const isHex = /^[0-9a-fA-F]+$/.test(trimmed) && trimmed.length % 2 === 0;
+    if (isHex) {
+        const hexBuf = Buffer.from(trimmed, 'hex');
+        try {
+            const iv = hexBuf.slice(0, 16);
+            const cipher = hexBuf.slice(16);
+            if (cipher.length > 0) {
+                const decipher = crypto.createDecipheriv('aes-256-cbc', keyBuffer, iv);
+                decipher.setAutoPadding(true);
+                let out = decipher.update(cipher, undefined, 'utf8');
+                out += decipher.final('utf8');
+                JSON.parse(out); 
+                return { decrypted: out, method: 'AES-256-CBC (HEX, IV đầu 16B)' };
+            }
+        } catch(e) {}
+        try {
+            const iv = Buffer.alloc(16, 0);
+            const decipher = crypto.createDecipheriv('aes-256-cbc', keyBuffer, iv);
+            decipher.setAutoPadding(true);
+            let out = decipher.update(hexBuf, undefined, 'utf8');
+            out += decipher.final('utf8');
+            JSON.parse(out); 
+            return { decrypted: out, method: 'AES-256-CBC (HEX, IV=zeros)' };
+        } catch(e) {}
+    }
+
+    try {
+        const b64Buf = Buffer.from(trimmed, 'base64');
+        const iv = b64Buf.slice(0, 16);
+        const cipher = b64Buf.slice(16);
+        if (cipher.length > 0) {
+            const decipher = crypto.createDecipheriv('aes-256-cbc', keyBuffer, iv);
+            decipher.setAutoPadding(true);
+            let out = decipher.update(cipher, undefined, 'utf8');
+            out += decipher.final('utf8');
+            JSON.parse(out); 
+            return { decrypted: out, method: 'AES-256-CBC (Base64, IV đầu 16B)' };
+        }
+    } catch(e) {}
+
+    return null;
 }
 
 // -------------------------------------------------------------
@@ -273,7 +397,7 @@ app.get('/api/poll-events', (req, res) => {
     });
 });
 
-app.post('/api/clear-events', (req, res) => {
+app.post('/api/clear-events', async (req, res) => {
     const { clientId } = req.body;
     if (!clientId) return res.status(400).json({ error: 'Thiếu clientId' });
     const session = getSession(clientId);
@@ -281,7 +405,30 @@ app.post('/api/clear-events', (req, res) => {
         session.pollQueue = [];
         session.eventQueue = [];
     }
+    try {
+        await sql`DELETE FROM ipn_logs WHERE client_id = ${clientId}`;
+    } catch(e) {
+        console.error("Lỗi xóa IPN DB:", e);
+    }
     res.json({ success: true });
+});
+
+app.get('/api/ipns', async (req, res) => {
+    const { clientId } = req.query;
+    if (!clientId) return res.status(400).json({ error: 'Thiếu clientId' });
+    try {
+        const { rows } = await sql`
+            SELECT id, client_id, source, matched_name, matched_color, matched_id, body_obj, 
+                   TO_CHAR(created_at, 'YYYY-MM-DD"T"HH24:MI:SS') as created_at 
+            FROM ipn_logs 
+            WHERE client_id = ${clientId} 
+            ORDER BY id DESC LIMIT 50
+        `;
+        res.json({ ipns: rows });
+    } catch(e) {
+        console.error("Lỗi lấy lịch sử IPN:", e);
+        res.status(500).json({ error: 'Lỗi lấy IPN' });
+    }
 });
 
 // -------------------------------------------------------------
@@ -306,20 +453,19 @@ app.get('/api/debug-sessions', (req, res) => {
 // -------------------------------------------------------------
 // APP CẤU HÌNH NHIỀU SECRET KEY CỦA TỪNG PHIÊN
 // -------------------------------------------------------------
-app.get('/api/config-keys', (req, res) => {
+app.get('/api/config-keys', async (req, res) => {
     const { clientId } = req.query;
     if (!clientId) return res.status(400).json({ error: 'Thiếu clientId' });
-    const session = getSession(clientId);
-    const out = (session && session.keys) ? session.keys.map(k => ({ id: k.id, name: k.name, value: k.originalStr, color: k.color })) : [];
+    const keys = await getClientKeys(clientId);
+    const out = keys.map(k => ({ id: k.id, name: k.name, value: k.originalStr, color: k.color }));
     res.json({ keys: out });
 });
 
-app.post('/api/config-keys', (req, res) => {
+app.post('/api/config-keys', async (req, res) => {
     const { keys, clientId } = req.body;
     if (!clientId) return res.status(400).json({ error: 'Thiếu clientId' });
     if (!Array.isArray(keys)) return res.status(400).json({ error: 'Dữ liệu keys không hợp lệ' });
     
-    const session = getSession(clientId);
     const validKeys = [];
 
     for (const k of keys) {
@@ -349,16 +495,48 @@ app.post('/api/config-keys', (req, res) => {
         return res.status(400).json({ error: 'Tất cả các Key bạn nhập đều sai định dạng (phải là 32 bytes plain text hoặc 64 bytes HEX).' });
     }
 
-    session.keys = validKeys;
-    emitLogToUI(clientId, 'success', `🔑 Đã cập nhật xong danh sách ${validKeys.length} Secret Key!`);
-    res.json({ success: true, count: validKeys.length });
+    try {
+        await sql`DELETE FROM client_keys WHERE client_id = ${clientId}`;
+        for (const vk of validKeys) {
+            const encryptedVal = encryptDbValue(vk.originalStr);
+            await sql`
+                INSERT INTO client_keys (client_id, key_id, name, value, color)
+                VALUES (${clientId}, ${vk.id}, ${vk.name}, ${encryptedVal}, ${vk.color})
+            `;
+            
+            // Cập nhật hồi tố Tên và Màu sắc cho lịch sử IPN
+            await sql`
+                UPDATE ipn_logs 
+                SET matched_name = ${vk.name}, matched_color = ${vk.color}
+                WHERE client_id = ${clientId} AND matched_id = ${vk.id}
+            `;
+        }
+        
+        // Cập nhật UI thông qua SSE
+        const session = getSession(clientId);
+        if (session) {
+            const entry = {
+                type: 'keys_updated',
+                id: Date.now() + '_' + Math.random().toString(36).substr(2, 5),
+                time: new Date().toLocaleTimeString(),
+                message: 'Danh sách Key đã được cập nhật bởi một thiết bị khác. Đang tải lại...'
+            };
+            pushToQueue(session, entry);
+            broadcastToClients(session, entry);
+        }
+
+        emitLogToUI(clientId, 'success', `🔑 Đã cập nhật xong danh sách ${validKeys.length} Secret Key vào Database!`);
+        res.json({ success: true, count: validKeys.length });
+    } catch(e) {
+        console.error("DB Error save keys:", e);
+        res.status(500).json({ error: "Lỗi lưu DB" });
+    }
 });
 
-app.post('/api/reevaluate-packets', (req, res) => {
+app.post('/api/reevaluate-packets', async (req, res) => {
     const { packets, clientId } = req.body;
     if (!clientId) return res.status(400).json({ error: 'Thiếu clientId' });
-    const session = getSession(clientId);
-    if (!session) return res.json({ success: true, results: packets.map(() => ({ matchedName: 'Giải mã thất bại', matchedColor: '#ef4444', matchedId: 'unmatched' })) });
+    const keys = await getClientKeys(clientId);
 
     const results = packets.map(dataBaggage => {
         let payload = null;
@@ -396,38 +574,14 @@ app.post('/api/reevaluate-packets', (req, res) => {
         let matchedKeyId = 'unmatched';
 
         if (payload) {
-            for (const kObj of session.keys) {
-                try {
-                    const keyBuffer = kObj.buffer;
-                    let decryptedString;
-                    const payloadParts = payload.split(':');
-
-                    if (payloadParts.length === 3) {
-                        const iv = Buffer.from(payloadParts[0], 'base64');
-                        const authTag = Buffer.from(payloadParts[1], 'base64');
-                        const encryptedText = Buffer.from(payloadParts[2], 'base64');
-                        const decipher = crypto.createDecipheriv('aes-256-gcm', keyBuffer, iv);
-                        decipher.setAuthTag(authTag);
-                        decipher.update(encryptedText, undefined, 'utf8');
-                        decipher.final('utf8');
-                        matchedKeyName = kObj.name;
-                        matchedKeyColor = kObj.color || '#10b981';
-                        matchedKeyId = kObj.id;
-                        break;
-                    } else {
-                        const hexPayload = payload.trim();
-                        const iv = Buffer.from(hexPayload.slice(0, 32), 'hex');
-                        const encryptedText = Buffer.from(hexPayload.slice(32), 'hex');
-                        const decipher = crypto.createDecipheriv('aes-256-cbc', keyBuffer, iv);
-                        decipher.setAutoPadding(true);
-                        decipher.update(encryptedText, undefined, 'utf8');
-                        decipher.final('utf8');
-                        matchedKeyName = kObj.name;
-                        matchedKeyColor = kObj.color || '#10b981';
-                        matchedKeyId = kObj.id;
-                        break;
-                    }
-                } catch (err) {}
+            for (const kObj of keys) {
+                const result = attemptDecrypt(payload, kObj.buffer);
+                if (result) {
+                    matchedKeyName = kObj.name;
+                    matchedKeyColor = kObj.color || '#10b981';
+                    matchedKeyId = kObj.id;
+                    break;
+                }
             }
         }
 
@@ -480,7 +634,7 @@ app.use((req, res, next) => {
 });
 
 // Chấp nhận URL ngắn (/:clientId) và các đường dẫn cũ
-app.all(['/:clientId', '/webhook/ipn', '/webhook/ipn/:clientId'], (req, res) => {
+app.all(['/:clientId', '/webhook/ipn', '/webhook/ipn/:clientId'], async (req, res) => {
     let clientId = req.params.clientId;
     
     // Nếu không có ID trên URL, tìm Client đang mở Dashboard gần nhất
@@ -565,50 +719,16 @@ app.all(['/:clientId', '/webhook/ipn', '/webhook/ipn/:clientId'], (req, res) => 
         let matchedTgMethod = '';
 
         // Dò tất cả các Key xem Key nào mở được khóa
-        for (const kObj of session.keys) {
-            try {
-                const keyBuffer = kObj.buffer;
-                let decryptedString;
-                const payloadParts = payload.split(':');
-
-                if (payloadParts.length === 3) {
-                    // Định dạng AES-256-GCM
-                    const iv = Buffer.from(payloadParts[0], 'base64');
-                    const authTag = Buffer.from(payloadParts[1], 'base64');
-                    const encryptedText = Buffer.from(payloadParts[2], 'base64');
-                    const decipher = crypto.createDecipheriv('aes-256-gcm', keyBuffer, iv);
-                    decipher.setAuthTag(authTag);
-                    decryptedString = decipher.update(encryptedText, undefined, 'utf8');
-                    decryptedString += decipher.final('utf8');
-                    
-                    // Thử parse JSON, nếu không lỗi là thành công
-                    JSON.parse(decryptedString);
-                    decodedPayload = decryptedString;
-                    matchedKeyName = kObj.name;
-                    matchedKeyColor = kObj.color || '#10b981';
-                    matchedKeyId = kObj.id || 'unmatched';
-                    matchedTgMethod = 'AES-256-GCM';
-                    break; // Thành công với key này thì ngưng vòng lặp
-                } else {
-                    // Định dạng AES-256-CBC
-                    const hexPayload = payload.trim();
-                    const iv = Buffer.from(hexPayload.slice(0, 32), 'hex');
-                    const encryptedText = Buffer.from(hexPayload.slice(32), 'hex');
-                    const decipher = crypto.createDecipheriv('aes-256-cbc', keyBuffer, iv);
-                    decipher.setAutoPadding(true);
-                    decryptedString = decipher.update(encryptedText, undefined, 'utf8');
-                    decryptedString += decipher.final('utf8');
-                    
-                    JSON.parse(decryptedString);
-                    decodedPayload = decryptedString;
-                    matchedKeyName = kObj.name;
-                    matchedKeyColor = kObj.color || '#10b981';
-                    matchedKeyId = kObj.id || 'unmatched';
-                    matchedTgMethod = 'AES-256-CBC (IV đầu 16B)';
-                    break;
-                }
-            } catch (err) {
-                // Key này giải không ra, bỏ qua để thử Key tiếp theo
+        const keys = await getClientKeys(clientId);
+        for (const kObj of keys) {
+            const result = attemptDecrypt(payload, kObj.buffer);
+            if (result) {
+                decodedPayload = result.decrypted;
+                matchedKeyName = kObj.name;
+                matchedKeyColor = kObj.color || '#10b981';
+                matchedKeyId = kObj.id || 'unmatched';
+                matchedTgMethod = result.method;
+                break;
             }
         }
 
@@ -618,6 +738,16 @@ app.all(['/:clientId', '/webhook/ipn', '/webhook/ipn/:clientId'], (req, res) => 
 
             const paymentData = JSON.parse(decodedPayload);
             emitLogToUI(clientId, 'success', `✅ Giải mã tự động thành công (Nguồn: ${matchedKeyName})! Dữ liệu gốc:`, paymentData, true);
+            
+            try {
+                const bodyObjStr = typeof dataBaggage === 'string' ? dataBaggage : JSON.stringify(dataBaggage);
+                await sql`
+                    INSERT INTO ipn_logs (client_id, source, matched_name, matched_color, matched_id, body_obj, created_at)
+                    VALUES (${clientId}, 'Webhook IPN', ${matchedKeyName}, ${matchedKeyColor}, ${matchedKeyId}, ${bodyObjStr}::jsonb, NOW() AT TIME ZONE 'Asia/Ho_Chi_Minh')
+                `;
+            } catch(e) {
+                console.error("Lỗi insert IPN to DB:", e);
+            }
 
             // AUTO-SEND to Telegram 
             if (session.tgAutoSend && session.tgToken && session.tgChatId) {
@@ -633,6 +763,17 @@ app.all(['/:clientId', '/webhook/ipn', '/webhook/ipn/:clientId'], (req, res) => 
             // Giải mã thất bại
             emitRawIPN(clientId, req.body, 'Giải mã thất bại', '#ef4444', 'unmatched');
             emitLogToUI(clientId, 'error', `❌ Nhận IPN nhưng TẤT CẢ các Secret Key hiện tại đều giải mã thất bại. Vui lòng kiểm tra lại cấu hình Key. Dữ liệu gốc:`, req.body);
+            
+            try {
+                const bodyObjStr = typeof req.body === 'string' ? req.body : JSON.stringify(req.body);
+                await sql`
+                    INSERT INTO ipn_logs (client_id, source, matched_name, matched_color, matched_id, body_obj, created_at)
+                    VALUES (${clientId}, 'Webhook IPN', 'Giải mã thất bại', '#ef4444', 'unmatched', ${bodyObjStr}::jsonb, NOW() AT TIME ZONE 'Asia/Ho_Chi_Minh')
+                `;
+            } catch(e) {
+                console.error("Lỗi insert IPN to DB (thất bại):", e);
+            }
+
             return res.status(200).json({ return_code: 0, message: 'Received but decryption failed with all known keys' });
         }
 
@@ -725,12 +866,12 @@ app.get('/api/telegram-status', (req, res) => {
 // -------------------------------------------------------------
 // ENDPOINT DEBUG: PHÂN TÍCH TOÀN BỘ BODY RAW TỪ WEBHOOK
 // -------------------------------------------------------------
-app.post('/api/debug-analyze', (req, res) => {
+app.post('/api/debug-analyze', async (req, res) => {
     const { payloadStruct, clientId } = req.body; 
     const raw = payloadStruct;
     if (!clientId) return res.status(400).json({ error: 'Thiếu clientId' });
 
-    const session = getSession(clientId);
+    const keys = await getClientKeys(clientId);
     const results = { rawBody: raw, analysis: [] };
 
     for (const [key, val] of Object.entries(raw)) {
@@ -740,13 +881,13 @@ app.post('/api/debug-analyze', (req, res) => {
         const isHex = /^[0-9a-fA-F]+$/.test(strVal) && strVal.length % 2 === 0;
 
         // Vòng lặp test trọn bộ danh sách Secret Keys do user cấu hình
-        for (const kObj of session.keys) {
+        for (const kObj of keys) {
             const keyBuffer = kObj.buffer;
             const prefix = `[Key: ${kObj.name}] `;
 
             if (isHex) {
                 const hexBuf = Buffer.from(strVal, 'hex');
-                if (session.keys.indexOf(kObj) === 0) {
+                if (keys.indexOf(kObj) === 0) {
                      // Log 1 lần duy nhất preview Decode HEX
                      entry.attempts.push({ method: 'HEX decode info', byteLength: hexBuf.length, preview: hexBuf.toString('utf8', 0, Math.min(50, hexBuf.length)) });
                 }
@@ -775,7 +916,7 @@ app.post('/api/debug-analyze', (req, res) => {
 
             try {
                 const b64Buf = Buffer.from(strVal, 'base64');
-                if (session.keys.indexOf(kObj) === 0) {
+                if (keys.indexOf(kObj) === 0) {
                      // Log 1 lần duy nhất preview Decode Base64
                      entry.attempts.push({ method: 'Base64 decode info', byteLength: b64Buf.length, preview: b64Buf.toString('utf8', 0, Math.min(50, b64Buf.length)) });
                 }
@@ -827,17 +968,16 @@ app.post('/api/simulate-payment', async (req, res) => {
         const { clientId, payloadData, selectedKeyId } = req.body;
         if (!clientId) return res.status(400).json({ error: 'Thiếu clientId' });
 
-        const session = getSession(clientId);
-        if (!session || !session.keys || session.keys.length === 0) {
+        const keys = await getClientKeys(clientId);
+        if (keys.length === 0) {
             return res.status(400).json({ error: 'Bạn đang không có bất kỳ Secret Key nào để mã hóa giả lập!' });
         }
 
-        let targetKeyObj = session.keys[0];
+        let targetKeyObj = keys[0];
         if (selectedKeyId) {
-            const found = session.keys.find(k => k.id === selectedKeyId);
+            const found = keys.find(k => k.id === selectedKeyId);
             if (found) targetKeyObj = found;
         }
-
         const jsonString = JSON.stringify(payloadData);
         const iv = crypto.randomBytes(12);
         const cipher = crypto.createCipheriv('aes-256-gcm', targetKeyObj.buffer, iv);

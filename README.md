@@ -6,7 +6,8 @@ Một giải pháp toàn diện và giao diện đẹp mắt dùng để hứng,
 
 ## ✨ Tính Năng Nổi Bật
 
-*   **📡 Real-time Webhook Feed:** Dữ liệu webhook lọt vào máy chủ sẽ được bắn ngay lên giao diện Web UI hiển thị tức thì không cần tải lại trang thông qua công nghệ **Server-Sent Events (SSE)**.
+*   **📡 Real-time Webhook Feed:** Dữ liệu webhook lọt vào máy chủ sẽ được bắn ngay lên giao diện Web UI hiển thị tức thì không cần tải lại trang thông qua công nghệ **Server-Sent Events (SSE)** kết hợp **HTTP Polling** dự phòng cực kỳ ổn định.
+*   **🗄️ Lưu Trữ Dữ Liệu Bền Vững (PostgreSQL):** Tích hợp Database (Vercel/Neon Postgres) để lưu trữ Cấu hình Secret Key, Cấu hình Telegram và Lịch sử IPN. Đảm bảo dữ liệu đồng bộ mượt mà giữa nhiều thiết bị, không bị mất khi đóng trình duyệt hay khởi động lại Server. Hỗ trợ chuẩn múi giờ địa phương (UTC+7).
 *   **🔑 Multi-Key & Auto-Decrypt:** Quản lý không giới hạn số lượng Secret Key (Tên đối tác, Màu sắc hiển thị). Tự động chạy dò đệ quy các key để giải mã payload (Hỗ trợ cả thuật toán `AES-256-GCM` và `AES-256-CBC`).
 *   **🗂️ Lọc dữ liệu theo Tab thông minh:** Khi thiết lập nhiều Key, giao diện tự động chia hệ thống Feed ra làm các bộ lọc Tab độc lập. Gói tin trúng Key nào tự chui vào Tab đó, kèm theo **Huy hiệu thông báo đếm số (Badge Unread)** để bạn không bao giờ bỏ sót tin mới. Các tin rác/không khớp sẽ bị cách ly ra "Tab Thất Bại".
 *   **🤖 Tích hợp Bot Telegram:** Tuỳ chọn cài đặt Bot Token và nhóm (Chat ID) để phần mềm tự động bắn thẳng giao dịch sau khi giải mã lên ứng dụng Telegram cho hệ thống kế toán hoặc nhân viên theo dõi.
@@ -21,6 +22,7 @@ Một giải pháp toàn diện và giao diện đẹp mắt dùng để hứng,
 Để chạy được dự án này, máy tính hoặc Server của bạn cần cài đặt:
 - **Node.js** (Phiên bản v14.0.0 trở lên)
 - **NPM** (Node Package Manager)
+- **PostgreSQL Database** (Sử dụng URL kết nối của Vercel Postgres hoặc Neon DB)
 
 ---
 
@@ -31,17 +33,27 @@ Một giải pháp toàn diện và giao diện đẹp mắt dùng để hứng,
 **Bước 2:** Cài đặt các thư viện cần thiết.
 ```bash
 npm install
-# Hoặc nếu chưa có file package.json thì hãy chạy: npm install express
 ```
 
-**Bước 3:** Khởi động máy chủ Webhook.
+**Bước 3:** Cấu hình biến môi trường (`.env`).
+Tạo một file có tên `.env` ở thư mục gốc của dự án và điền thông tin kết nối Database của bạn (Vercel Postgres):
+```env
+POSTGRES_URL="postgres://user:password@host/dbname"
+```
+
+**Bước 4:** Khởi tạo Database (Chỉ chạy 1 lần duy nhất).
+```bash
+node init-db.js
+```
+
+**Bước 5:** Khởi động máy chủ Webhook.
 ```bash
 npm start
 # Hoặc bạn có thể chạy trực tiếp: node server.js
 ```
 *Lưu ý: Mặc định server sẽ chạy ở port **3000**.*
 
-**Bước 4:** Mở trình duyệt và truy cập vào Dashboard tại:
+**Bước 6:** Mở trình duyệt và truy cập vào Dashboard tại:
 👉 `http://localhost:3000`
 
 ---
@@ -53,7 +65,7 @@ Mở thêm 1 cửa sổ CMD mới (vẫn giữ phần mềm Node kia đang chạ
 ```bash
 ngrok http 3000
 ```
-Ngrok sẽ cung cấp cho bạn một đường Link có dạnh `https://xxxxxx.ngrok.app`. Lúc này, bạn chép link đó rồi cộng thêm nhánh Endpoint Webhook cá nhân của bạn (Lấy ở dòng sáng nhất trên Website Dashboard).
+Ngrok sẽ cung cấp cho bạn một đường Link có dạng `https://xxxxxx.ngrok.app`. Lúc này, bạn chép link đó rồi cộng thêm nhánh Endpoint Webhook cá nhân của bạn (Lấy ở dòng sáng nhất trên Website Dashboard).
 
 Ví dụ bạn gửi cho cổng thanh toán là: **`https://abcd-efgh.ngrok.app/9c24b17f...`**
 
@@ -63,17 +75,19 @@ Ví dụ bạn gửi cho cổng thanh toán là: **`https://abcd-efgh.ngrok.app/
 1. Trên giao diện Web, bấm **+ Thêm Cấu Hình**.
 2. Điền **Tên Đại diện**, Chọn **Màu Sắc** để dán Tag.
 3. Nhập **Secret Key** chuẩn xác bằng mã HEX hoặc dạng Text Plain (Dài đúng 32 bytes / 32 Ký tự / 64 HEX).
-4. Nhấn **Lưu Toàn Bộ Key**. 
+4. Nhấn **Lưu Toàn Bộ Key**. Cấu hình này sẽ được lưu an toàn vào cơ sở dữ liệu PostgreSQL.
 
 Kể từ lúc này, mọi dữ kiện mã hóa gửi vào Endpoint của bạn sẽ bị "nhào lặn" và bẻ khoá tự động, sắp xếp vào Tab hiển thị Raw JSON.
 
 ---
 
 ## 👨‍💻 Cấu trúc thư mục (File Structure)
-- `/server.js` - Chứa toàn bộ Backend Core, mã hoá, tạo lập session in-memory và điều phối WebSocket (SSE).
+- `/.env` - Biến môi trường chứa thông tin kết nối DB.
+- `/init-db.js` - Script hỗ trợ khởi tạo nhanh bảng Cấu hình (client_keys) và bảng Lịch sử (ipn_logs) trong Postgres.
+- `/server.js` - Chứa toàn bộ Backend Core, mã hoá, kết nối Database, và điều phối Server-Sent Events (SSE) / Polling.
 - `/public/index.html` - Trang HTML định hình bộ khung UI của Dashboard.
 - `/public/style.css` - Bảng quy tắc thiết kế mang âm hưởng "Hacker/Cyberpunk Glassmorphism".
-- `/public/script.js` - Logic Frontend điều khiển hiển thị Tab, liên kết Simulator, điều khiển form.
+- `/public/script.js` - Logic Frontend điều khiển hiển thị Tab, liên kết Simulator, lấy lịch sử IPN từ Server, đồng bộ dữ liệu.
 
 ---
 **Chúc bạn Coding ngon giấc và Test IPN mượt mà!** 🍵
