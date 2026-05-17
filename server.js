@@ -368,6 +368,38 @@ setInterval(() => {
 }, 15000); // 15 giây kiểm tra một lần
 
 // -------------------------------------------------------------
+// AUTO-CLEANUP: Xóa IPN cũ hơn 1 tháng để tránh tràn Database
+// -------------------------------------------------------------
+async function cleanupOldIPNLogs() {
+    try {
+        // Đảm bảo bảng client_keys có cột created_at
+        await sql`ALTER TABLE client_keys ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT (NOW() AT TIME ZONE 'Asia/Ho_Chi_Minh')`;
+
+        const resultIPN = await sql`
+            DELETE FROM ipn_logs 
+            WHERE created_at < NOW() - INTERVAL '1 month'
+        `;
+        
+        const resultKeys = await sql`
+            DELETE FROM client_keys 
+            WHERE created_at < NOW() - INTERVAL '1 month'
+        `;
+
+        if (resultIPN.rowCount > 0 || resultKeys.rowCount > 0) {
+            SystemLogToConsole('info', `🧹 Đã dọn dẹp tự động ${resultIPN.rowCount} IPN và ${resultKeys.rowCount} Secret Key cũ hơn 1 tháng.`);
+        }
+    } catch (e) {
+        SystemLogToConsole('error', `Lỗi khi dọn dẹp DB cũ: ${e.message}`);
+    }
+}
+
+// Chạy dọn dẹp ngay khi khởi động server
+cleanupOldIPNLogs();
+
+// Định kỳ chạy dọn dẹp mỗi 12 tiếng (12 * 60 * 60 * 1000 ms)
+setInterval(cleanupOldIPNLogs, 12 * 60 * 60 * 1000);
+
+// -------------------------------------------------------------
 // HTTP POLLING FALLBACK: Cho phép UI lấy events khi SSE không ổn định
 // -------------------------------------------------------------
 app.get('/api/poll-events', (req, res) => {

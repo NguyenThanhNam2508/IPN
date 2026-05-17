@@ -26,6 +26,14 @@ document.addEventListener('DOMContentLoaded', () => {
     const iptUniqueUrl  = document.getElementById('iptUniqueUrl');
     const btnCopyUrl    = document.getElementById('btnCopyUrl');
 
+    const btnNewTab    = document.getElementById('btnNewTab');
+
+    if (btnNewTab) {
+        btnNewTab.addEventListener('click', () => {
+            window.open('/', '_blank');
+        });
+    }
+
     // --- Session ID Initialization ---
     // Extract ID from path or hash
     let pathId = window.location.pathname.substring(1).replace(/\/$/, "");
@@ -104,6 +112,7 @@ document.addEventListener('DOMContentLoaded', () => {
     let keysArray = [];
     let currentActiveTab = null;
     let unreadCounts = {};
+    let compareQueue = [];
 
     function switchTab(tabId) {
         currentActiveTab = tabId;
@@ -502,7 +511,7 @@ document.addEventListener('DOMContentLoaded', () => {
         fields.className = 'packet-fields';
 
         // Render each field as a row
-        renderFieldRows(bodyObj, fields, '');
+        renderFieldRows(bodyObj, fields, '', matchedName);
 
         card.appendChild(meta);
         card.appendChild(fields);
@@ -547,7 +556,7 @@ document.addEventListener('DOMContentLoaded', () => {
     // ============================
     // RENDER FIELD ROWS (recursive for nested objects)
     // ============================
-    function renderFieldRows(obj, container, prefix) {
+    function renderFieldRows(obj, container, prefix, matchedName = '') {
         for (const [key, val] of Object.entries(obj)) {
             const fullKey = prefix ? `${prefix}.${key}` : key;
 
@@ -558,7 +567,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 groupDiv.innerHTML = `<div style="font-size:0.72rem;color:var(--text-dim);padding:0.2rem 0.6rem;font-family:'JetBrains Mono',monospace;">▼ ${fullKey} { }</div>`;
                 const nested = document.createElement('div');
                 nested.style.cssText = 'margin-left:0.75rem;border-left:1px solid rgba(255,255,255,0.06);padding-left:0.5rem;';
-                renderFieldRows(val, nested, fullKey);
+                renderFieldRows(val, nested, fullKey, matchedName);
                 groupDiv.appendChild(nested);
                 container.appendChild(groupDiv);
                 continue;
@@ -590,7 +599,7 @@ document.addEventListener('DOMContentLoaded', () => {
             // Attach decrypt handler
             const btn = row.querySelector('.btn-decrypt');
             if (btn) {
-                btn.addEventListener('click', () => handleDecrypt(btn, fullKey, strVal));
+                btn.addEventListener('click', () => handleDecrypt(btn, fullKey, strVal, matchedName));
             }
 
             container.appendChild(row);
@@ -620,7 +629,7 @@ document.addEventListener('DOMContentLoaded', () => {
     // ============================
     // DECRYPT HANDLER
     // ============================
-    async function handleDecrypt(btn, fieldKey, encryptedValue) {
+    async function handleDecrypt(btn, fieldKey, encryptedValue, matchedName = '') {
         // Clear previous decrypt results before showing new one
         decryptContent.innerHTML = '';
         decryptTotal = 0;
@@ -675,7 +684,7 @@ document.addEventListener('DOMContentLoaded', () => {
                     Đã giải ↺
                 `;
                 btn.disabled = false;
-                addDecryptResult(fieldKey, successAttempt);
+                addDecryptResult(fieldKey, successAttempt, null, false, matchedName);
                 showToast(`Giải mã "${fieldKey}" thành công!`, 'success');
             } else {
                 // Failed
@@ -707,7 +716,7 @@ document.addEventListener('DOMContentLoaded', () => {
     // ============================
     // ADD DECRYPT RESULT CARD
     // ============================
-    function addDecryptResult(fieldKey, attempt, timeStr = null, isRestore = false) {
+    function addDecryptResult(fieldKey, attempt, timeStr = null, isRestore = false, sourceTabName = '') {
         const emptyEl = decryptContent.querySelector('.empty-state');
         if (emptyEl) emptyEl.remove();
 
@@ -828,6 +837,50 @@ document.addEventListener('DOMContentLoaded', () => {
         actionHtml.style.marginTop = '12px';
         actionHtml.appendChild(tgBtn);
         actionHtml.appendChild(copyBtn);
+
+        const compareBtn = document.createElement('button');
+        compareBtn.className = 'btn-compare';
+        const defaultCompareHtml = `
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                <path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/>
+            </svg>
+            So sánh
+        `;
+        compareBtn.innerHTML = defaultCompareHtml;
+        compareBtn.addEventListener('click', () => {
+            const index = compareQueue.findIndex(item => item.btn === compareBtn);
+            if (index !== -1) {
+                compareQueue.splice(index, 1);
+                compareBtn.classList.remove('selected');
+                compareBtn.innerHTML = defaultCompareHtml;
+            } else {
+                if (compareQueue.length >= 2) {
+                    showToast('Bạn chỉ có thể so sánh tối đa 2 IPN!', 'error');
+                    return;
+                }
+                compareBtn.classList.add('selected');
+                compareBtn.innerHTML = `
+                    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                        <polyline points="20 6 9 17 4 12"/>
+                    </svg>
+                    Đã chọn (1/2) - Chọn IPN thứ 2
+                `;
+                const titleToUse = sourceTabName && sourceTabName !== '[Chưa rõ nguồn]' 
+                    ? `[${sourceTabName}]` 
+                    : fieldKey;
+                compareQueue.push({
+                    title: titleToUse,
+                    data: parsedData || attempt.data,
+                    btn: compareBtn,
+                    defaultHtml: defaultCompareHtml
+                });
+                
+                if (compareQueue.length === 2) {
+                    showComparisonModal(compareQueue[0], compareQueue[1]);
+                }
+            }
+        });
+        actionHtml.appendChild(compareBtn);
 
         card.querySelector('.decrypt-card-body').appendChild(actionHtml);
 
@@ -1196,5 +1249,107 @@ document.addEventListener('DOMContentLoaded', () => {
     }
     
     loadIPNs();
+
+    // ============================
+    // IPN COMPARISON LOGIC
+    // ============================
+    const compareModal = document.getElementById('compareModal');
+    const btnCloseCompare = document.getElementById('btnCloseCompare');
+    const compareTitle1 = document.getElementById('compareTitle1');
+    const compareTitle2 = document.getElementById('compareTitle2');
+    const compareContent1 = document.getElementById('compareContent1');
+    const compareContent2 = document.getElementById('compareContent2');
+
+    if (btnCloseCompare) {
+        btnCloseCompare.addEventListener('click', () => {
+            compareModal.classList.remove('show');
+            // Deselect all
+            compareQueue.forEach(item => {
+                item.btn.classList.remove('selected');
+                item.btn.innerHTML = item.defaultHtml;
+            });
+            compareQueue = [];
+        });
+    }
+
+    function showComparisonModal(item1, item2) {
+        if (!compareModal) return;
+        compareTitle1.textContent = item1.title;
+        compareTitle2.textContent = item2.title;
+        
+        let obj1 = item1.data;
+        let obj2 = item2.data;
+
+        if (typeof obj1 === 'string') { try { obj1 = JSON.parse(obj1); } catch(e){} }
+        if (typeof obj2 === 'string') { try { obj2 = JSON.parse(obj2); } catch(e){} }
+
+        if (typeof obj1 === 'object' && obj1 !== null && typeof obj2 === 'object' && obj2 !== null) {
+            const diff1 = [];
+            const diff2 = [];
+            generateDiff(obj1, obj2, diff1, diff2, 0);
+            compareContent1.innerHTML = `<div class="json-tree">${diff1.join('')}</div>`;
+            compareContent2.innerHTML = `<div class="json-tree">${diff2.join('')}</div>`;
+        } else {
+            compareContent1.innerHTML = `<pre>${escapeHtml(String(obj1))}</pre>`;
+            compareContent2.innerHTML = `<pre>${escapeHtml(String(obj2))}</pre>`;
+        }
+
+        compareModal.classList.add('show');
+    }
+
+    function generateDiff(o1, o2, html1, html2, indent) {
+        const indentStr = '&nbsp;'.repeat(indent * 4);
+        
+        html1.push(`<div class="diff-line"><span class="diff-val-brace">{</span></div>`);
+        html2.push(`<div class="diff-line"><span class="diff-val-brace">{</span></div>`);
+        
+        const keys = new Set([...Object.keys(o1), ...Object.keys(o2)]);
+        
+        keys.forEach(k => {
+            const in1 = o1.hasOwnProperty(k);
+            const in2 = o2.hasOwnProperty(k);
+            const v1 = o1[k];
+            const v2 = o2[k];
+            
+            const v1Type = typeof v1;
+            const v2Type = typeof v2;
+
+            if (in1 && !in2) {
+                // Removed
+                html1.push(`<div class="diff-line diff-modified">${indentStr}&nbsp;&nbsp;&nbsp;&nbsp;<span class="diff-key">"${escapeHtml(k)}"</span>: ${formatValue(v1)}</div>`);
+                html2.push(`<div class="diff-line diff-modified">${indentStr}&nbsp;&nbsp;&nbsp;&nbsp;</div>`);
+            } else if (!in1 && in2) {
+                // Added
+                html1.push(`<div class="diff-line diff-modified">${indentStr}&nbsp;&nbsp;&nbsp;&nbsp;</div>`);
+                html2.push(`<div class="diff-line diff-modified">${indentStr}&nbsp;&nbsp;&nbsp;&nbsp;<span class="diff-key">"${escapeHtml(k)}"</span>: ${formatValue(v2)}</div>`);
+            } else {
+                // Both
+                if (v1Type === 'object' && v1 !== null && v2Type === 'object' && v2 !== null) {
+                    html1.push(`<div class="diff-line">${indentStr}&nbsp;&nbsp;&nbsp;&nbsp;<span class="diff-key">"${escapeHtml(k)}"</span>:</div>`);
+                    html2.push(`<div class="diff-line">${indentStr}&nbsp;&nbsp;&nbsp;&nbsp;<span class="diff-key">"${escapeHtml(k)}"</span>:</div>`);
+                    generateDiff(v1, v2, html1, html2, indent + 1);
+                } else if (v1 !== v2) {
+                    // Modified
+                    html1.push(`<div class="diff-line diff-modified">${indentStr}&nbsp;&nbsp;&nbsp;&nbsp;<span class="diff-key">"${escapeHtml(k)}"</span>: ${formatValue(v1)}</div>`);
+                    html2.push(`<div class="diff-line diff-modified">${indentStr}&nbsp;&nbsp;&nbsp;&nbsp;<span class="diff-key">"${escapeHtml(k)}"</span>: ${formatValue(v2)}</div>`);
+                } else {
+                    // Unchanged
+                    html1.push(`<div class="diff-line">${indentStr}&nbsp;&nbsp;&nbsp;&nbsp;<span class="diff-key">"${escapeHtml(k)}"</span>: ${formatValue(v1)}</div>`);
+                    html2.push(`<div class="diff-line">${indentStr}&nbsp;&nbsp;&nbsp;&nbsp;<span class="diff-key">"${escapeHtml(k)}"</span>: ${formatValue(v2)}</div>`);
+                }
+            }
+        });
+        
+        html1.push(`<div class="diff-line">${indentStr}<span class="diff-val-brace">}</span></div>`);
+        html2.push(`<div class="diff-line">${indentStr}<span class="diff-val-brace">}</span></div>`);
+    }
+
+    function formatValue(v) {
+        if (v === null) return '<span class="diff-val-null">null</span>';
+        if (typeof v === 'string') return `<span class="diff-val-string">"${escapeHtml(v)}"</span>`;
+        if (typeof v === 'number') return `<span class="diff-val-number">${v}</span>`;
+        if (typeof v === 'boolean') return `<span class="diff-val-boolean">${v}</span>`;
+        return `<span class="diff-val-string">"${escapeHtml(String(v))}"</span>`;
+    }
 
 });
