@@ -174,6 +174,44 @@ function attemptDecrypt(payload, keyBuffer) {
     return null;
 }
 
+function extractPayload(dataBaggage, clientId = null) {
+    let payload = null;
+    if (typeof dataBaggage === 'string') {
+        const rawBodyStr = dataBaggage.trim();
+        const match = rawBodyStr.match(/[a-fA-F0-9\-]{40,}|[A-Za-z0-9+/=]{40,}/);
+        payload = match ? match[0] : rawBodyStr;
+        if (payload && clientId) SystemLogToConsole('info', 'Phát hiện payload từ raw text body.', payload, clientId);
+    } else if (dataBaggage && typeof dataBaggage === 'object') {
+        payload = dataBaggage.payload || dataBaggage.data || dataBaggage.token || dataBaggage.message || dataBaggage.cipher;
+        
+        if (!payload) {
+            const searchDeep = (obj) => {
+                for (const k of Object.keys(obj)) {
+                    if (k.length > 40 && /^[0-9a-fA-F\-]+$/.test(k)) {
+                        if (clientId) SystemLogToConsole('info', 'Phát hiện payload nằm ở KEY của Object (do lỗi parser hoặc đối tác gửi thiếu dấu =).', k, clientId);
+                        return k.trim();
+                    }
+                    const val = obj[k];
+                    if (typeof val === 'string' && val.length > 40) return val.trim();
+                    if (typeof val === 'object' && val !== null) {
+                        const found = searchDeep(val);
+                        if (found) return found;
+                    }
+                }
+                return null;
+            };
+            payload = searchDeep(dataBaggage);
+        }
+    }
+
+    if (typeof payload === 'string') {
+        payload = payload.trim();
+        if (payload.startsWith("'") && payload.endsWith("'")) payload = payload.slice(1, -1);
+        if (payload.startsWith('"') && payload.endsWith('"')) payload = payload.slice(1, -1);
+    }
+    return payload;
+}
+
 // -------------------------------------------------------------
 // TELEGRAM BOT HELPER
 // -------------------------------------------------------------
@@ -456,6 +494,36 @@ app.get('/api/ipns', async (req, res) => {
             WHERE client_id = ${clientId} 
             ORDER BY id DESC LIMIT 50
         `;
+        
+        // --- TỰ ĐỘNG RE-EVALUATE CÁC IPN THẤT BẠI ---
+        let keys = null;
+        for (let row of rows) {
+            if (row.matched_id === 'unmatched') {
+                if (!keys) keys = await getClientKeys(clientId);
+                
+                const dataBaggage = typeof row.body_obj === 'string' ? JSON.parse(row.body_obj) : row.body_obj;
+                const payload = extractPayload(dataBaggage);
+                
+                if (payload) {
+                    for (const kObj of keys) {
+                        const result = attemptDecrypt(payload, kObj.buffer);
+                        if (result) {
+                            row.matched_name = kObj.name;
+                            row.matched_color = kObj.color || '#10b981';
+                            row.matched_id = kObj.id;
+                            
+                            await sql`
+                                UPDATE ipn_logs 
+                                SET matched_name = ${kObj.name}, matched_color = ${kObj.color}, matched_id = ${kObj.id}
+                                WHERE id = ${row.id}
+                            `;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
         res.json({ ipns: rows });
     } catch(e) {
         console.error("Lỗi lấy lịch sử IPN:", e);
@@ -571,35 +639,7 @@ app.post('/api/reevaluate-packets', async (req, res) => {
     const keys = await getClientKeys(clientId);
 
     const results = packets.map(dataBaggage => {
-        let payload = null;
-        if (typeof dataBaggage === 'string') {
-            const rawBodyStr = dataBaggage.trim();
-            const match = rawBodyStr.match(/[a-fA-F0-9\-]{40,}|[A-Za-z0-9+/=]{40,}/);
-            payload = match ? match[0] : rawBodyStr;
-        } else if (dataBaggage && typeof dataBaggage === 'object') {
-            payload = dataBaggage.payload || dataBaggage.data || dataBaggage.token || dataBaggage.message || dataBaggage.cipher;
-            if (!payload) {
-                const searchDeep = (obj) => {
-                    for (const k of Object.keys(obj)) {
-                        if (k.length > 40 && /^[0-9a-fA-F\-]+$/.test(k)) return k.trim();
-                        const val = obj[k];
-                        if (typeof val === 'string' && val.length > 40) return val.trim();
-                        if (typeof val === 'object' && val !== null) {
-                            const found = searchDeep(val);
-                            if (found) return found;
-                        }
-                    }
-                    return null;
-                };
-                payload = searchDeep(dataBaggage);
-            }
-        }
-
-        if (typeof payload === 'string') {
-            payload = payload.trim();
-            if (payload.startsWith("'") && payload.endsWith("'")) payload = payload.slice(1, -1);
-            if (payload.startsWith('"') && payload.endsWith('"')) payload = payload.slice(1, -1);
-        }
+        const payload = extractPayload(dataBaggage);
 
         let matchedKeyName = '[Chưa rõ nguồn]';
         let matchedKeyColor = '#ef4444';
@@ -691,55 +731,14 @@ app.all(['/:clientId', '/webhook/ipn', '/webhook/ipn/:clientId'], async (req, re
         emitLogToUI(clientId, 'info', `--- CÓ HTTP ${req.method} MỚI TỚI WEBHOOK BẠN ---`);
         
         // Smart Payload Extraction (hỗ trợ nhiều định dạng và cả GET Request)
-        let payload = null;
         let dataBaggage = req.method === 'GET' ? req.query : req.body;
+        let payload = extractPayload(dataBaggage, clientId);
         
-        if (typeof dataBaggage === 'string') {
-            const rawBodyStr = dataBaggage.trim();
-            // Dùng Regex moi cái mảng HEX hoặc Base64 dài
-            const match = rawBodyStr.match(/[a-fA-F0-9\-]{40,}|[A-Za-z0-9+/=]{40,}/);
-            payload = match ? match[0] : rawBodyStr;
-            if (payload) SystemLogToConsole('info', 'Phát hiện payload từ raw text body.', payload, clientId);
-        } else if (dataBaggage && typeof dataBaggage === 'object') {
-            // Ưu tiên các field chuẩn
-            payload = dataBaggage.payload || dataBaggage.data || dataBaggage.token || dataBaggage.message || dataBaggage.cipher;
-            
-            if (!payload) {
-                const searchDeep = (obj) => {
-                    for (const k of Object.keys(obj)) {
-                        // Trường hợp 1: Key chính là HEX dài (thường do lỗi parser form-urlencoded khi thiếu dấu =)
-                        if (k.length > 40 && /^[0-9a-fA-F\-]+$/.test(k)) {
-                            SystemLogToConsole('info', 'Phát hiện payload nằm ở KEY của Object (do lỗi parser hoặc đối tác gửi thiếu dấu =).', k, clientId);
-                            return k.trim();
-                        }
-                        // Trường hợp 2: Value là HEX/Base64 dài
-                        const val = obj[k];
-                        if (typeof val === 'string' && val.length > 40) return val.trim();
-                        
-                        // Trường hợp 3: Đệ quy nếu là object nhỏ
-                        if (typeof val === 'object' && val !== null) {
-                            const found = searchDeep(val);
-                            if (found) return found;
-                        }
-                    }
-                    return null;
-                };
-                payload = searchDeep(dataBaggage);
-            }
-        }
-
         if (!payload) {
             SystemLogToConsole('error', 'Không tìm thấy bất kỳ chuỗi Encrypted Payload nào trong Request.', dataBaggage, clientId);
             emitLogToUI(clientId, 'error', 'Không tìm thấy dữ liệu hợp lệ (HEX/Base64/GCM) trong Request. Dashboard không thể tự giải mã.', dataBaggage);
             emitRawIPN(clientId, dataBaggage, 'Payload Trống/Lỗi');
             return res.status(400).json({ error: 'Missing Payload', receivedData: dataBaggage });
-        }
-
-        // Loại bỏ các ký tự rác nếu lỗi encode, ví dụ ' ở đầu
-        if (typeof payload === 'string') {
-            payload = payload.trim();
-            if (payload.startsWith("'") && payload.endsWith("'")) payload = payload.slice(1, -1);
-            if (payload.startsWith('"') && payload.endsWith('"')) payload = payload.slice(1, -1);
         }
 
         emitLogToUI(clientId, 'info', `Toàn bộ Request từ đối tác (Gửi qua ${req.method}):`, dataBaggage, true); 
